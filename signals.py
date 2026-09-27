@@ -85,11 +85,10 @@ def compute_technical_score(ticker: str, as_of: date | None = None) -> Technical
     # which already match config's MACD_FAST/MACD_SLOW/MACD_SIGNAL.
     macd_histogram = float(frame["macdh"].iloc[-1])
     macd_mean_abs = frame["macdh"].tail(MACD_MEAN_ABS_LOOKBACK_DAYS).abs().mean()
-    macd_score = (
-        0.0
-        if macd_mean_abs == 0
-        else _clip_to_unit_range(macd_histogram / macd_mean_abs)
-    )
+    if macd_mean_abs == 0:
+        macd_score = 0.0  # flat histogram history -> nothing to normalize against
+    else:
+        macd_score = _clip_to_unit_range(macd_histogram / macd_mean_abs)
 
     sma_fast = float(frame[f"close_{SMA_FAST}_sma"].iloc[-1])
     sma_slow = float(frame[f"close_{SMA_SLOW}_sma"].iloc[-1])
