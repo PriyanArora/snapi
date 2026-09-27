@@ -301,7 +301,7 @@ def reset_books() -> None:
     for persona_key, persona in PERSONAS.items():
         # Balanced only has a fill log under R5's simulator fallback.
         if persona.account == "simulator":
-            books.fills_path(persona_key).unlink(missing_ok=True)
+            books.clear_fills(persona_key)
 
     for persona_key, proposal in seed_proposals.items():
         execute(proposal, persona_key, tag="seed")

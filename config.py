@@ -188,7 +188,8 @@ DISCLAIMER = (
     "advice."
 )
 
-# Shared data files: books.py writes the run log, the app reads it (R9).
+# Local log files (R9): books.py reads and writes them, or their MongoDB
+# collections of the same name when MONGODB_URI is set (Hosting).
 DATA_DIR = Path(__file__).resolve().parent / "data"
 RUN_LOG_PATH = DATA_DIR / "run_log.jsonl"
 
