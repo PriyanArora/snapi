@@ -22,10 +22,12 @@ import logging
 import os
 from datetime import datetime
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit_shadcn_ui as ui
 from dotenv import load_dotenv
 
 import config
@@ -40,6 +42,67 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 APP_PASSWORD_ENV_VAR = "APP_PASSWORD"
+
+TAGLINE = "Turn your brokerage into your own AI hedge fund"
+LOGIN_CARD_WIDTH = 400
+# The logo's dot-matrix font echoes the login page's pixel background.
+LOGO_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Doto:wght@900&display=swap');
+.snapi-logo {
+  font-family: 'Doto', monospace;
+  font-weight: 900;
+  font-size: 4.5rem;
+  line-height: 1;
+  text-align: center;
+  color: #fff;
+  text-shadow: 0 0 22px rgba(255, 45, 150, 0.75), 0 0 2px rgba(255, 170, 215, 0.9);
+}
+"""
+# Login background: pink film grain, neon glows, and a pixel field that
+# fades out upward. The SVGs are URL-encoded below because Streamlit's HTML
+# sanitizer drops a <style> block that holds raw <svg> tags.
+GRAIN_SVG = (
+    "<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'>"
+    "<filter id='g'><feTurbulence type='fractalNoise' baseFrequency='.8' "
+    "numOctaves='2' stitchTiles='stitch'/>"
+    "<feColorMatrix values='0 0 0 0 1  0 0 0 0 .45  0 0 0 0 .8  1.6 0 0 0 -1.05'/>"
+    "</filter><rect width='100%' height='100%' filter='url(#g)'/></svg>"
+)
+# Pixelate: sample the noise once per 12px cell, then grow each sample into a square.
+PIXEL_SVG = (
+    "<svg xmlns='http://www.w3.org/2000/svg' width='640' height='640'>"
+    "<filter id='p' x='0' y='0' width='100%' height='100%'>"
+    "<feTurbulence type='fractalNoise' baseFrequency='.9' seed='4' "
+    "stitchTiles='stitch' result='noise'/>"
+    "<feFlood x='5' y='5' width='2' height='2'/>"
+    "<feComposite width='12' height='12'/><feTile result='samples'/>"
+    "<feComposite in='noise' in2='samples' operator='in'/>"
+    "<feMorphology operator='dilate' radius='4'/>"
+    "<feColorMatrix values='0 0 0 0 1  0 0 0 0 .2  0 0 0 0 .6  3 0 0 0 -1.8'/>"
+    "</filter><rect width='100%' height='100%' filter='url(#p)'/></svg>"
+)
+LOGIN_PAGE_CSS = f"""
+<style>
+.stApp {{
+  background-color: #060307;
+  background-image:
+    url("data:image/svg+xml,{quote(GRAIN_SVG)}"),
+    radial-gradient(55% 50% at 8% 108%, rgba(255, 45, 150, 0.45), transparent 70%),
+    radial-gradient(40% 38% at 96% -6%, rgba(255, 45, 150, 0.22), transparent 70%),
+    radial-gradient(38% 32% at 82% 96%, rgba(170, 60, 255, 0.14), transparent 70%),
+    linear-gradient(to bottom, #060307 0%, #060307 48%, rgba(6, 3, 7, 0.35) 78%, rgba(6, 3, 7, 0) 100%),
+    url("data:image/svg+xml,{quote(PIXEL_SVG)}");
+  background-size: 240px 240px, 100% 100%, 100% 100%, 100% 100%, 100% 100%, 640px 640px;
+  background-attachment: fixed;
+}}
+/* shadcn picks light or dark from the host's Streamlit background, so a
+   dark value here gives the login card shadcn's dark theme. */
+.stApp [data-testid="stBidiComponentIsolated"] {{ --st-background-color: #060307; }}
+header[data-testid="stHeader"] {{ display: none; }}
+[data-testid="stMainBlockContainer"] {{ padding-top: 14vh; }}
+</style>
+"""
+
 ANTHROPIC_KEY_ENV_VAR = "ANTHROPIC_API_KEY"
 # The macro regime behind seeding, Run swarm, Rebalance and Reset books.
 FRED_KEY_ENV_VAR = "FRED_API_KEY"
@@ -140,40 +203,84 @@ def read_app_password() -> str | None:
         return None
 
 
-def check_entered_password() -> None:
-    """Unlock the session when the typed password matches; the typed text is never kept."""
-    entered_password = st.session_state.pop("password")
+def is_password_correct(entered_password: str) -> bool:
+    """Return whether the typed password matches APP_PASSWORD, compared in constant time."""
     expected_password = read_app_password() or ""
 
     # Bytes, because compare_digest rejects non-ASCII str.
-    st.session_state["password_ok"] = hmac.compare_digest(
+    return hmac.compare_digest(
         entered_password.encode(),
         expected_password.encode(),
     )
 
 
+def render_logo() -> None:
+    """Draw the Snapi wordmark in its dot-matrix logo font."""
+    st.html(f'<style>{LOGO_CSS}</style><div class="snapi-logo">Snapi</div>')
+
+
+def render_login_card() -> tuple[str, bool]:
+    """Draw the shadcn tagline and password card; return the typed password and whether it was submitted."""
+    with ui.elements(key="login", width=LOGIN_CARD_WIDTH) as login:
+        with login.stack(gap="lg"):
+            with login.stack(align="center"):
+                login.text(TAGLINE, variant="muted")
+            with login.card():
+                with login.card_content():
+                    password_field = login.input(
+                        "Password",
+                        key="password",
+                        type="password",
+                        placeholder="Enter the app password",
+                    )
+                with login.card_footer():
+                    with login.stack(gap="md"):
+                        continue_button = login.button(
+                            "Continue",
+                            key="continue",
+                            stretch=True,
+                        )
+                        login.text(config.DISCLAIMER, variant="caption")
+
+    entered_password = password_field.value or ""
+    # Enter commits the field without a click, so a typed value is a submit too.
+    is_submitted = continue_button.clicked or bool(entered_password)
+    return entered_password, is_submitted
+
+
 def check_password() -> None:
-    """Show the disclaimer, then stop the script until the password matches APP_PASSWORD (S9, T17, Q13)."""
-    st.title("snapi")
-    st.caption(config.DISCLAIMER)
+    """Show the login page and stop the script until the password matches APP_PASSWORD (S9, T17, Q13)."""
     if st.session_state.get("password_ok"):
+        st.title("snapi")
+        st.caption(config.DISCLAIMER)
         return
 
-    if not read_app_password():
-        st.error(
-            f"No {APP_PASSWORD_ENV_VAR} found. Set it in .env (or the app's Secrets "
-            "on Streamlit Cloud) and restart the app."
-        )
-        st.stop()
+    st.html(LOGIN_PAGE_CSS)
+    with st.container(horizontal_alignment="center"):
+        render_logo()
+        if not read_app_password():
+            ui.alert(
+                f"No {APP_PASSWORD_ENV_VAR} found.",
+                "Set it in .env (or the app's Secrets on Streamlit Cloud) and restart the app.",
+                variant="destructive",
+                width=LOGIN_CARD_WIDTH,
+            )
+            st.stop()
 
-    st.text_input(
-        "Password",
-        type="password",
-        key="password",
-        on_change=check_entered_password,
-    )
-    if st.session_state.get("password_ok") is False:
-        st.error("Wrong password.")
+        entered_password, is_submitted = render_login_card()
+        if not is_submitted:
+            st.stop()
+
+        if is_password_correct(entered_password):
+            st.session_state["password_ok"] = True
+            st.rerun()
+
+        ui.alert(
+            "Wrong password.",
+            "Check the password and try again.",
+            variant="destructive",
+            width=LOGIN_CARD_WIDTH,
+        )
     st.stop()
 
 
