@@ -2,11 +2,10 @@
 
 Heavy modules (books, committee, execute, brokerage and everything they pull
 in: langgraph, langchain, snaptrade, external/) are imported inside the live
-functions that need them, not at the top. The PRD asks for lazy imports so
-the public replay never loads them (S9); that overrides the usual
-imports-at-the-top rule. Renderers take plain JSON-shaped dicts, so a run
-logged to `data/run_log.jsonl` and a run made in this session draw the same
-way.
+functions that need them, not at the top. The PRD asks for lazy imports to
+keep start-up fast; that overrides the usual imports-at-the-top rule.
+Renderers take plain JSON-shaped dicts, so a run logged to
+`data/run_log.jsonl` and a run made in this session draw the same way.
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ import hmac
 import json
 import logging
 import os
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
@@ -48,23 +47,13 @@ SANDBOX_SETUP_NOTE = (
 )
 
 ACTIVITY_SETUP_NOTE = (
-    "SnapTrade isn't configured. Set SNAPTRADE_CONSUMER_KEY, SNAPTRADE_CLIENT_ID, "
-    "SNAPTRADE_SANDBOX_ACCOUNT_ID and SNAPTRADE_ALPACA_PAPER_ACCOUNT_ID in .env "
-    "to show the Sandbox's activity and Alpaca Paper's order history."
-)
-NO_REPLAY_NOTE = "No replay saved yet."
-LIVE_DEMO_NOTE = (
-    "Live demo on laptop: this public app replays the committed rehearsal, "
-    "so its buttons are off."
+    "The Activity tab needs SNAPTRADE_CONSUMER_KEY, SNAPTRADE_CLIENT_ID, "
+    "SNAPTRADE_SANDBOX_ACCOUNT_ID and SNAPTRADE_ALPACA_PAPER_ACCOUNT_ID in .env."
 )
 CHAT_SETUP_NOTE = (
-    "The chat isn't configured. Set SNAPTRADE_MCP_URL and "
+    "The chat needs ANTHROPIC_API_KEY, SNAPTRADE_MCP_URL and "
     "SNAPTRADE_MCP_OAUTH_TOKEN (minted by hand, R6) in .env."
 )
-
-# Replay files the laptop writes and the public app reads (R7).
-ACTIVITY_SNAPSHOT_PATH = config.DATA_DIR / "activity_snapshot.json"
-CHAT_TRANSCRIPT_PATH = config.DATA_DIR / "chat_transcript.json"
 
 # SnapTrade's hosted MCP: 18 read-only tools, so the chat can't trade and
 # the SDK stays the only write path (S13, T21, story 42).
@@ -121,32 +110,14 @@ def read_jsonl(path: Path) -> list[dict]:
     return records
 
 
-def read_json(path: Path) -> dict | list | None:
-    """Return a saved replay file's contents, or None when it hasn't been saved yet."""
-    if not path.exists():
-        return None
-
-    return json.loads(path.read_text())
-
-
-def save_replay_button(label: str, path: Path, payload: dict | list) -> None:
-    """Offer to write this live view to its replay file, to be committed for the public app (R7)."""
-    if not st.button(label, key=f"save_{path.stem}"):
-        return
-
-    # default=str: SnapTrade's date fields may arrive as datetime objects.
-    path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
-    st.success(f"Saved data/{path.name}; commit it after the rehearsal.")
-
-
 def display_name(persona_key: str) -> str:
     """Return the persona's display name, for selector labels and notes."""
     return config.PERSONAS[persona_key].display_name
 
 
-def is_cloud_mode() -> bool:
-    """Return True without an Anthropic key: the public replay, or a laptop before its keys exist (S9)."""
-    return not os.environ.get(ANTHROPIC_KEY_ENV_VAR)
+def has_anthropic_key() -> bool:
+    """Return True when ANTHROPIC_API_KEY is set; Run swarm needs it."""
+    return bool(os.environ.get(ANTHROPIC_KEY_ENV_VAR))
 
 
 def show_live_error(action: str, error: Exception) -> None:
@@ -505,16 +476,6 @@ def caption_queued_lock() -> None:
 
 def approve_controls(run_record: dict) -> None:
     """Approve executes the proposal on screen for all three personas; nothing trades before it (story 22, T18)."""
-    if is_cloud_mode():
-        st.button(
-            "Approve",
-            type="primary",
-            key="approve",
-            disabled=True,
-            help=LIVE_DEMO_NOTE,
-        )
-        return
-
     caption_queued_lock()
     if not st.button("Approve", type="primary", key="approve"):
         return
@@ -530,50 +491,15 @@ def approve_controls(run_record: dict) -> None:
     clear_rebalance_state()
 
 
-def find_replay_run(records: list[dict]) -> tuple[dict | None, list[dict]]:
-    """Return the last run that was approved with its Approve batches, else the last run and no batches.
-
-    A run's Approve batches follow it in the log until the next run. The
-    rehearsal runs once more after Approve, and that last run has none.
-    """
-    runs_with_approvals = []
-    for record in records:
-        if record["kind"] == "run":
-            runs_with_approvals.append((record, []))
-        elif runs_with_approvals and record["tag"] == "committee":
-            runs_with_approvals[-1][1].append(record)
-
-    if not runs_with_approvals:
-        return None, []
-
-    for run, approvals in reversed(runs_with_approvals):
-        if approvals:
-            return run, approvals
-
-    last_run, _ = runs_with_approvals[-1]
-    return last_run, []
-
-
-def load_committee_replay() -> None:
-    """Put the committed run and what its Approve did where a live run would be, for the same renderers (R7)."""
-    run_record, approvals = find_replay_run(read_jsonl(config.RUN_LOG_PATH))
-    st.session_state["run_record"] = run_record
-    st.session_state["approval"] = None
-    if approvals:
-        # Skip and lock notes aren't logged; the batches are.
-        st.session_state["approval"] = {"notes": {}, "records": approvals}
-
-
 def committee_tab() -> None:
     """Run swarm fills five agent cards live; then the PM memo, three order tables and the critic beside Approve."""
     run_clicked = st.button(
         "Run swarm",
         type="primary",
-        disabled=is_cloud_mode(),
-        help=LIVE_DEMO_NOTE if is_cloud_mode() else None,
+        disabled=not has_anthropic_key(),
     )
-    if is_cloud_mode():
-        load_committee_replay()
+    if not has_anthropic_key():
+        st.caption(f"Run swarm needs {ANTHROPIC_KEY_ENV_VAR} in .env.")
 
     # Lay out every slot first, so cards fill in place while the graph streams.
     card_slots = {}
@@ -588,16 +514,9 @@ def committee_tab() -> None:
         run_swarm(card_slots)
 
     run_record = st.session_state.get("run_record")
-    if run_record is None and is_cloud_mode():
-        st.info(NO_REPLAY_NOTE)
-        return
-
     if run_record is None:
         st.info("Press Run swarm to convene the committee.")
         return
-
-    if is_cloud_mode():
-        st.caption(f"Replay of the committee run at {run_record['taken_at']}.")
 
     proposal = run_record["proposal"]
     for card, slot in card_slots.items():
@@ -832,20 +751,10 @@ def render_sandbox(rows: list[dict]) -> None:
 
 
 def sandbox_panel() -> None:
-    """Show the Sandbox holdings: live through the shared 60 s SnapTrade cache, on Cloud from the activity replay."""
-    st.subheader("SnapTrade Sandbox (demo data)")
-    if is_cloud_mode():
-        activity = read_json(ACTIVITY_SNAPSHOT_PATH)
-        if activity is None:
-            st.caption(NO_REPLAY_NOTE)
-            return
-
-        # Saved with the activity: the PRD reads both from one snapshot (S16).
-        render_sandbox(activity["sandbox_holdings"])
-        return
-
+    """Read the Sandbox holdings through the shared 60 s SnapTrade cache and show them, or say why not."""
     import brokerage
 
+    st.subheader("SnapTrade Sandbox (demo data)")
     if not brokerage.is_sandbox_configured():
         st.caption(SANDBOX_SETUP_NOTE)
         return
@@ -861,13 +770,9 @@ def sandbox_panel() -> None:
 
 def reset_books_control() -> None:
     """Clear the simulator fill logs and re-seed the opening books, for a clean rehearsal (S16, story 58)."""
-    st.subheader("Reset books")
-    if is_cloud_mode():
-        st.button("Reset books", disabled=True, help=LIVE_DEMO_NOTE, key="reset_books")
-        return
-
     import execute
 
+    st.subheader("Reset books")
     if st.session_state.pop("books_reset", False):
         st.success("Simulator books cleared and re-seeded.")
 
@@ -889,34 +794,8 @@ def reset_books_control() -> None:
     st.rerun()
 
 
-def render_replay_books() -> None:
-    """Draw every persona's book from the last logged run; Cloud can't import the live modules (D10, S9)."""
-    run_records = read_jsonl(config.RUN_LOG_PATH)
-    runs = [record for record in run_records if record["kind"] == "run"]
-    if not runs:
-        st.info(NO_REPLAY_NOTE)
-        return
-
-    last_run = runs[-1]
-    st.caption(f"Books as of the last logged run, {last_run['taken_at']}.")
-    for persona_key, persona in config.PERSONAS.items():
-        st.subheader(persona.display_name)
-        render_book(
-            persona_key,
-            last_run["books"][persona_key],
-            last_run["marks"],
-            last_run["sector_weights"][persona_key],
-        )
-        st.button(
-            "Rebalance",
-            key=f"rebalance_{persona_key}",
-            disabled=True,
-            help=LIVE_DEMO_NOTE,
-        )
-
-
-def render_live_books() -> None:
-    """Draw every persona's current book with its Rebalance controls (S8, S10)."""
+def portfolio_tab() -> None:
+    """Per-persona holdings and sector charts with Rebalance, then the Sandbox panel and Reset books."""
     import books
     import portfolio
     import prices
@@ -934,14 +813,6 @@ def render_live_books() -> None:
         render_book(persona_key, dataclasses.asdict(book), marks, weights_by_sector)
         rebalance_controls(persona_key, book, marks)
 
-
-def portfolio_tab() -> None:
-    """Per-persona holdings and sector charts with Rebalance, then the Sandbox panel and Reset books."""
-    if is_cloud_mode():
-        render_replay_books()
-    else:
-        render_live_books()
-
     sandbox_panel()
     reset_books_control()
 
@@ -955,10 +826,6 @@ def forward_test_tab() -> None:
     """Plot NAV per persona and SPY from the run log, normalized to the first logged run (S14, F23, stories 44-45)."""
     run_records = read_jsonl(config.RUN_LOG_PATH)
     runs = [record for record in run_records if record["kind"] == "run"]
-    if not runs and is_cloud_mode():
-        st.info(NO_REPLAY_NOTE)
-        return
-
     if not runs:
         st.info(
             "The forward test starts with the first Run swarm: "
@@ -1046,41 +913,8 @@ def render_alpaca_orders(orders: list[dict]) -> None:
     st.dataframe(newest_first, hide_index=True)
 
 
-def live_activity() -> dict:
-    """Read the Sandbox's holdings and activity and Alpaca Paper's recent orders, each through the 60 s cache.
-
-    The recent-orders read is the same all-status call the R4 lock uses, so
-    queued orders show with their status (Q11).
-    """
-    import brokerage
-
-    sandbox_id = brokerage.sandbox_account_id()
-    sandbox = brokerage.get_account_snapshot(sandbox_id)
-    holdings = [dataclasses.asdict(holding) for holding in sandbox.holdings]
-    return {
-        "captured_at": datetime.now(UTC).isoformat(timespec="seconds"),
-        # The Portfolio tab's Sandbox panel replays these (S16).
-        "sandbox_holdings": holdings,
-        "sandbox_activities": brokerage.get_activities(sandbox_id),
-        "alpaca_orders": brokerage.get_recent_orders(
-            brokerage.alpaca_paper_account_id()
-        ),
-    }
-
-
 def activity_tab() -> None:
     """Show SnapTrade Sandbox activity and Alpaca Paper order history, read-only (S12, story 40)."""
-    if is_cloud_mode():
-        activity = read_json(ACTIVITY_SNAPSHOT_PATH)
-        if activity is None:
-            st.info(NO_REPLAY_NOTE)
-            return
-
-        st.caption(f"Replay of the activity saved at {activity['captured_at']}.")
-        render_sandbox_activities(activity["sandbox_activities"])
-        render_alpaca_orders(activity["alpaca_orders"])
-        return
-
     import brokerage
 
     if not (
@@ -1089,20 +923,26 @@ def activity_tab() -> None:
         st.info(ACTIVITY_SETUP_NOTE)
         return
 
+    # Both reads go through the 60 s cache. Recent orders is the same
+    # all-status read the R4 lock uses, so queued orders show their status (Q11).
     try:
-        activity = live_activity()
+        activities = brokerage.get_activities(brokerage.sandbox_account_id())
+        orders = brokerage.get_recent_orders(brokerage.alpaca_paper_account_id())
     except Exception as error:
         show_live_error("Reading SnapTrade activity", error)
         return
 
-    render_sandbox_activities(activity["sandbox_activities"])
-    render_alpaca_orders(activity["alpaca_orders"])
-    save_replay_button("Save activity replay", ACTIVITY_SNAPSHOT_PATH, activity)
+    render_sandbox_activities(activities)
+    render_alpaca_orders(orders)
 
 
 def is_chat_configured() -> bool:
-    """Return True when the MCP URL and the hand-minted OAuth token are both set (R6)."""
-    required_env_vars = (SNAPTRADE_MCP_URL_ENV_VAR, SNAPTRADE_MCP_TOKEN_ENV_VAR)
+    """Return True when the Anthropic key, the MCP URL and the hand-minted OAuth token are all set (R6)."""
+    required_env_vars = (
+        ANTHROPIC_KEY_ENV_VAR,
+        SNAPTRADE_MCP_URL_ENV_VAR,
+        SNAPTRADE_MCP_TOKEN_ENV_VAR,
+    )
     return all(os.environ.get(name) for name in required_env_vars)
 
 
@@ -1154,7 +994,7 @@ def ask_portfolio_chat(history: list[dict], question: str) -> None:
         with st.spinner("Reading your SnapTrade accounts..."):
             reply = portfolio_chat_model().invoke(messages)
     except Exception as error:
-        # An expired token lands here (Risk #15); the saved transcript is the fallback.
+        # An expired token lands here (Risk #15): mint a new one (R6).
         show_live_error("The portfolio chat", error)
         return
 
@@ -1164,16 +1004,7 @@ def ask_portfolio_chat(history: list[dict], question: str) -> None:
 
 
 def chat_tab() -> None:
-    """Answer plain-English portfolio questions through SnapTrade's hosted MCP (S13, stories 41-42)."""
-    if is_cloud_mode():
-        transcript = read_json(CHAT_TRANSCRIPT_PATH)
-        if transcript is None:
-            st.info(NO_REPLAY_NOTE)
-        else:
-            render_chat_turns(transcript)
-        st.chat_input(CHAT_PLACEHOLDER, disabled=True)
-        return
-
+    """Answer plain-English portfolio questions through SnapTrade's hosted MCP, live only (S13, stories 41-42)."""
     if not is_chat_configured():
         st.info(CHAT_SETUP_NOTE)
         return
@@ -1184,20 +1015,13 @@ def chat_tab() -> None:
     if question:
         ask_portfolio_chat(history, question)
 
-    if history:
-        save_replay_button("Save transcript", CHAT_TRANSCRIPT_PATH, history)
-
 
 def main() -> None:
     """Render the gated app; tabs follow the Q12 demo narrative."""
     st.set_page_config(page_title="snapi", layout="wide")
-    load_dotenv()  # laptop keys from .env; the Cloud app has none
+    load_dotenv()  # keys from .env
     check_password()
-    if is_cloud_mode():
-        # No keys: every tab replays the committed files and nothing live runs (S9).
-        st.info(LIVE_DEMO_NOTE)
-    else:
-        prepare_live_books()
+    prepare_live_books()
 
     tab_labels = ["Committee", "Portfolio", "Activity", "Chat", "Forward test"]
     committee_area, portfolio_area, activity_area, chat_area, forward_test_area = (
