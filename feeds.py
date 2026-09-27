@@ -136,18 +136,13 @@ def _ticker_news_from_alpha_vantage(payload: dict, ticker: str) -> TickerNews:
 
 
 def fetch_alpha_vantage_news(ticker: str) -> TickerNews:
-    """Return `ticker`'s recent articles and per-ticker sentiment from Alpha Vantage.
+    """Return `ticker`'s recent articles and per-ticker sentiment from Alpha Vantage, cached daily (S1, Risk #16).
 
-    One call per ticker: a multi-ticker call would only return articles that
-    mention every ticker. Cached to disk once a day, so a dev rerun spends no
-    call (S1, Risk #16).
-
-    Raises FeedUnavailableError if the key is missing, the request times out,
-    fails to connect, comes back with an HTTP error status, or its body
-    isn't valid JSON, or Alpha Vantage answers HTTP 200 with a
-    Note/Information/Error Message body (its rate-limit and misconfiguration
-    signal).
+    Raises FeedUnavailableError when the key is missing, the request fails
+    or Alpha Vantage rejects it.
     """
+    # One call per ticker: a multi-ticker call returns only the articles
+    # that mention every ticker.
     cache_name = f"alpha_vantage-{ticker}"
     cached_payload = _read_cache(cache_name)
     if cached_payload is not None:
@@ -171,6 +166,7 @@ def fetch_alpha_vantage_news(ticker: str) -> TickerNews:
             f"Alpha Vantage request failed for {ticker!r}: {error}"
         ) from error
 
+    # Rate limits and bad keys still come back as HTTP 200, with one of these keys.
     is_rejected = any(key in payload for key in ALPHA_VANTAGE_REJECTION_KEYS)
     if is_rejected:
         raise FeedUnavailableError(
@@ -182,12 +178,9 @@ def fetch_alpha_vantage_news(ticker: str) -> TickerNews:
 
 
 def fetch_alpaca_news(tickers: tuple[str, ...]) -> dict[str, TickerNews]:
-    """Return headline-only news per ticker from Alpaca News (no sentiment field).
+    """Return headline-only news per ticker from one multi-symbol Alpaca News call; the Sentiment agent scores them.
 
-    One multi-symbol call; the Sentiment agent scores these headlines itself.
-    Raises FeedUnavailableError if the Alpaca keys are missing, the request
-    times out, fails to connect, comes back with an HTTP error status (e.g.
-    401), or its body isn't valid JSON.
+    Raises FeedUnavailableError when the Alpaca keys are missing or the request fails.
     """
     api_key_id = os.environ.get("ALPACA_API_KEY_ID")
     api_secret_key = os.environ.get("ALPACA_API_SECRET_KEY")
@@ -283,14 +276,10 @@ def fetch_fear_and_greed() -> float | None:
 
 
 def fetch_macro_series() -> dict[str, float]:
-    """Return the latest value of each macro checklist series from FRED.
+    """Return the latest T10Y3M, SAHMREALTIME, BAMLH0A0HYM2 and VIXCLS values from FRED (F13).
 
-    Covers T10Y3M, SAHMREALTIME, BAMLH0A0HYM2 and VIXCLS (F13); SPY against
-    its 200-day SMA comes from the price snapshot instead.
-
-    Raises FeedUnavailableError if FRED_API_KEY is missing, a series has no
-    data, fredapi rejects the key or request (ValueError), or the network
-    call fails (URLError).
+    Raises FeedUnavailableError when FRED_API_KEY is missing, a series is
+    empty or the request fails.
     """
     api_key = os.environ.get("FRED_API_KEY")
     if not api_key:
