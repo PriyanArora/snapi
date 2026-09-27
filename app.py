@@ -20,6 +20,10 @@ import hmac
 import json
 import logging
 import os
+import queue
+import textwrap
+import threading
+import time
 from datetime import datetime
 from typing import TYPE_CHECKING
 from urllib.parse import quote
@@ -29,6 +33,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit_shadcn_ui as ui
 from dotenv import load_dotenv
+from pydantic_core import to_jsonable_python
 
 import config
 
@@ -37,7 +42,7 @@ if TYPE_CHECKING:
     from streamlit.delta_generator import DeltaGenerator
 
     from brokerage import AccountSnapshot
-    from committee import Proposal, Snapshot
+    from committee import Proposal
     from portfolio import Book, RebalanceResult
 
 logger = logging.getLogger(__name__)
@@ -136,7 +141,9 @@ header[data-testid="stHeader"] { display: none; }
   --font-weight-medium: 800;
   --spacing: 0.26rem;
 }
-[class*="st-key-brokerage_card_"] {
+[class*="st-key-brokerage_card_"],
+[class*="st-key-order_card_"],
+[class*="st-key-pending_node_"] {
   background: rgba(255, 255, 255, 0.7);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
@@ -214,23 +221,55 @@ BACKTEST_SETUP_NOTE = (
 NEW_YORK = ZoneInfo("America/New_York")
 SATURDAY = 5  # datetime.weekday(): Monday is 0
 
+COMMITTEE_INTRO = (
+    "A swarm of AI agents: three analysts read the market side by side, a "
+    "portfolio manager weighs them, code sizes three portfolios, a devil's "
+    "advocate pushes back, and a final judge recommends one."
+)
 ANALYSTS = ("sentiment", "technical", "macro")
+# Agent card titles, keyed by the Proposal field each card shows.
 CARD_TITLES = {
     "sentiment": "Sentiment analyst",
     "technical": "Technical analyst",
     "macro": "Macro analyst",
     "pm": "Portfolio Manager",
     "critique": "Devil's advocate",
+    "verdict": "Final verdict",
 }
-# Graph node name -> the state key its update carries. The critic writes
-# "critique"; the size node is code only and has no card.
-CARD_BY_NODE = {
-    "sentiment": "sentiment",
-    "technical": "technical",
-    "macro": "macro",
-    "pm": "pm",
-    "critic": "critique",
+MODEL_SELECT_WIDTH = 170
+APPROVE_BAR_WIDTH = 460
+CARD_PREVIEW_CHARS = 220
+TOP_ORDER_ROWS = 3
+# The graph's state keys that the Proposal names differently.
+PROPOSAL_FIELD_BY_STATE_KEY = {
+    "proposals": "orders",
+    "recommended": "recommended_persona",
 }
+# The user's rule: a live run still going after 15 s shows the latest saved
+# Sonnet run until it finishes. The ceiling stops the page waiting forever.
+FALLBACK_AFTER_SECONDS = 15
+RUN_CEILING_SECONDS = 300
+POLL_SECONDS = 0.5
+# Each persona card's opening words; the numbers come from config.PERSONAS.
+PERSONA_STANCES = {
+    "conservative": "Tight limits",
+    "balanced": "Middle ground",
+    "aggressive": "Loose limits",
+}
+ACCOUNT_NOTES = {
+    "simulator": "Trades on the simulator.",
+    "alpaca_paper": "Trades on Alpaca Paper through SnapTrade.",
+}
+APPROVE_CHOICES = ("recommended", "balanced", "conservative", "aggressive")
+# The flow's connectors live in a 600-wide viewBox stretched to the page:
+# x 100, 300 and 500 are the centers of three equal columns, 300 the middle.
+CONNECTOR_COLOR = "#7FA3A6"
+CONNECTOR_HEIGHT = 44
+COLUMN_CENTERS = (100, 300, 500)
+PAGE_CENTER = 300
+CONVERGE_LINES = [(column_x, PAGE_CENTER) for column_x in COLUMN_CENTERS]
+BRANCH_LINES = [(PAGE_CENTER, column_x) for column_x in COLUMN_CENTERS]
+DOWN_LINE = [(PAGE_CENTER, PAGE_CENTER)]
 
 
 def display_name(persona_key: str) -> str:
@@ -443,65 +482,114 @@ def prepare_live_books() -> None:
             st.warning(f"{persona.display_name} can't trade: {blocker}")
 
 
-def render_analyst_report(report: dict) -> None:
-    """List each ticker's score with its one-line why; an abstained analyst shows its error first."""
-    if report["abstained"]:
-        st.warning(report["why"].get("error", "Abstained this cycle."))
-
+def analyst_lines(report: dict) -> list[str]:
+    """Return an analyst's full text: an abstain note first, then one "AAPL +0.42: why" line per ticker."""
     lines = []
-    for ticker, score in report["score"].items():
-        why = report["why"].get(ticker, "")
-        lines.append(f"- **{ticker}** {score:+.2f}: {why}")
-
-    st.markdown(escape_markdown_math("\n".join(lines)))
-
-
-def render_macro_report(report: dict) -> None:
-    """Show the regime and each derived flag, raised or clear, with its why (never the raw FRED series)."""
     if report["abstained"]:
-        st.warning(report["why"].get("error", "Abstained this cycle."))
+        lines.append(report["why"].get("error", "Abstained this cycle."))
 
-    regime = report["regime"].replace("_", "-")
-    lines = [f"Regime: **{regime}**"]
+    for ticker, score in report["score"].items():
+        lines.append(f"{ticker} {score:+.2f}: {report['why'].get(ticker, '')}")
+
+    return lines
+
+
+def macro_lines(report: dict) -> list[str]:
+    """Return the regime and each derived flag, raised or clear, with its why (never the raw FRED series)."""
+    lines = []
+    if report["abstained"]:
+        lines.append(report["why"].get("error", "Abstained this cycle."))
+
+    lines.append(f"Regime: {report['regime'].replace('_', '-')}")
     for flag, is_raised in report["flags"].items():
         status = "raised" if is_raised else "clear"
-        why = report["why"].get(flag, "")
-        lines.append(f"- **{flag}** {status}: {why}")
+        lines.append(f"{flag} {status}: {report['why'].get(flag, '')}")
 
-    st.markdown(escape_markdown_math("\n".join(lines)))
+    return lines
 
 
-def render_pm_view(pm_view: dict) -> None:
-    """Show the PM memo and every name it dropped, with the reason (R1: drop-only)."""
-    st.markdown(escape_markdown_math(pm_view["memo"]))
+def pm_lines(pm_view: dict) -> list[str]:
+    """Return the PM memo and every name it dropped, with the reason (R1: drop-only)."""
+    lines = [pm_view["memo"]]
     for drop in pm_view["drops"]:
-        drop_line = f"Dropped **{drop['ticker']}**: {drop['reason']}"
-        st.markdown(escape_markdown_math(drop_line))
+        lines.append(f"Dropped {drop['ticker']}: {drop['reason']}")
+
+    return lines
 
 
-def render_critique(critique: dict) -> None:
-    """Show the critic's notes and, per persona, the code-computed holdings down more than 10% from cost (S5, Q10)."""
-    st.markdown(escape_markdown_math(critique["notes"]))
-
-    lines = ["Down more than 10% from cost:"]
+def critique_lines(critique: dict) -> list[str]:
+    """Return the critic's notes and, per persona, the code-computed holdings down more than 10% from cost (S5, Q10)."""
+    lines = [critique["notes"], "Down more than 10% from cost:"]
     for persona_key, tickers in critique["down_more_than_10pct"].items():
-        lines.append(f"- {display_name(persona_key)}: {', '.join(tickers) or 'none'}")
+        lines.append(f"{display_name(persona_key)}: {', '.join(tickers) or 'none'}")
 
-    st.markdown("\n".join(lines))
+    return lines
 
 
-def render_card(slot: DeltaGenerator, card: str, report: dict) -> None:
-    """Draw one agent's card into its slot, replacing whatever the slot showed before (S11)."""
-    with slot.container(border=True):
-        st.markdown(f"**{CARD_TITLES[card]}**")
-        if card == "pm":
-            render_pm_view(report)
-        elif card == "critique":
-            render_critique(report)
-        elif card == "macro":
-            render_macro_report(report)
-        else:
-            render_analyst_report(report)
+def verdict_lines(verdict: dict) -> list[str]:
+    """Return the final judge's summary and the persona it says to follow."""
+    return [verdict["summary"], f"Follow: {display_name(verdict['persona'])}"]
+
+
+def agent_lines(card: str, report: dict) -> list[str]:
+    """Return one agent card's full text as lines, for its preview and its Show more popup."""
+    if card == "pm":
+        return pm_lines(report)
+
+    if card == "critique":
+        return critique_lines(report)
+
+    if card == "verdict":
+        return verdict_lines(report)
+
+    if card == "macro":
+        return macro_lines(report)
+
+    return analyst_lines(report)
+
+
+def show_full_text(title: str, text: str) -> None:
+    """Open a popup with an agent's whole output, so its card never has to summarise."""
+
+    def render_text() -> None:
+        st.markdown(escape_markdown_math(text))
+
+    st.dialog(title, width="large")(render_text)()
+
+
+def render_pending_node(node_key: str, title: str) -> None:
+    """Draw a node whose agent hasn't reported yet: its title over a shadcn skeleton."""
+    with st.container(border=True, height="stretch", key=f"pending_node_{node_key}"):
+        with ui.elements(key=f"pending_title_{node_key}") as heading:
+            heading.heading(title, level=4)
+        ui.skeleton(skeleton_height=72, key=f"skeleton_{node_key}")
+
+
+def render_agent_node(card: str, report: dict | None) -> None:
+    """Draw one agent as a shadcn card cut to about 220 characters, with Show more for the full text."""
+    title = CARD_TITLES[card]
+    if report is None:
+        render_pending_node(card, title)
+        return
+
+    lines = agent_lines(card, report)
+    preview = textwrap.shorten(" ".join(lines), CARD_PREVIEW_CHARS, placeholder="…")
+    with ui.elements(key=f"agent_{card}") as agent_card:
+        with agent_card.card():
+            with agent_card.card_header():
+                agent_card.heading(title, level=4)
+            with agent_card.card_content():
+                agent_card.text(preview)
+            with agent_card.card_footer():
+                show_more = agent_card.button(
+                    "Show more",
+                    key="show_more",
+                    variant="outline",
+                    size="sm",
+                )
+
+    if show_more.clicked:
+        show_full_text(title, "\n\n".join(lines))
 
 
 def render_orders(orders: list[dict]) -> None:
@@ -525,62 +613,314 @@ def render_orders(orders: list[dict]) -> None:
     st.dataframe(rows, hide_index=True)
 
 
-def render_persona_orders(orders_by_persona: dict[str, list[dict]]) -> None:
-    """Show the three personas' order tables side by side: one view, three books (story 43)."""
-    columns = st.columns(len(config.PERSONAS))
-    for column, (persona_key, persona) in zip(
-        columns, config.PERSONAS.items(), strict=True
-    ):
-        with column:
-            st.markdown(f"**{persona.display_name}** orders")
-            render_orders(orders_by_persona[persona_key])
+PROPOSED_ORDER_COLUMNS = [
+    ui.TableColumn(key="side", label="Side"),
+    ui.TableColumn(key="ticker", label="Ticker"),
+    ui.TableColumn(key="shares", label="Shares", align="right"),
+    ui.TableColumn(key="price", label="Price", align="right"),
+    ui.TableColumn(key="notional", label="Notional", align="right"),
+]
+# Side, Ticker and Shares: the card's top-3 table fits three cards side by
+# side at 1024 px; View all adds Price and Notional.
+TOP_ORDER_COLUMNS = PROPOSED_ORDER_COLUMNS[:3]
 
 
-def stream_committee(
-    snapshot: Snapshot,
-    card_slots: dict[str, DeltaGenerator],
-) -> Proposal:
-    """Stream the graph in "updates" mode, filling each card as its node finishes, and return the proposal.
-
-    The loop runs in the main script thread: Streamlit is never called
-    inside a graph node, which has no session context (R8).
-    """
-    import committee
-
-    graph_updates = committee.build_graph().stream(
-        {"snapshot": snapshot},
-        stream_mode="updates",
+def proposed_order_rows(orders: list[dict]) -> list[dict[str, str]]:
+    """Return a proposal's orders as display rows, largest notional first."""
+    largest_first = sorted(
+        orders,
+        key=lambda order: order["price"] * order["quantity"],
+        reverse=True,
     )
-    state = {"snapshot": snapshot}
-    for update in graph_updates:
-        for node_name, node_update in update.items():
-            state.update(node_update)
-            card = CARD_BY_NODE.get(node_name)
-            if card is not None:
-                report = node_update[card].model_dump(mode="json")
-                render_card(card_slots[card], card, report)
 
-    return committee.build_proposal(state)
+    rows = []
+    for order in largest_first:
+        rows.append(
+            {
+                "side": order["side"].capitalize(),
+                "ticker": order["ticker"],
+                "shares": format_quantity(order["quantity"]),
+                "price": format_money(order["price"]),
+                "notional": format_money(order["price"] * order["quantity"]),
+            }
+        )
+
+    return rows
 
 
-def run_swarm(card_slots: dict[str, DeltaGenerator]) -> None:
-    """Run one committee cycle, log it with every persona's NAV (F23) and keep it in the session for Approve."""
-    import books
+def persona_summary(persona_key: str) -> str:
+    """Return the persona's limits and account in one line, read from config so the numbers never drift."""
+    persona = config.PERSONAS[persona_key]
+    return (
+        f"{PERSONA_STANCES[persona_key]}: {persona.sector_cap:.0%} per sector, "
+        f"{persona.max_position_pct:.0%} per stock, {persona.cash_buffer:.0%} cash. "
+        f"{ACCOUNT_NOTES[persona.account]}"
+    )
 
-    # A new run replaces the proposal on screen; nothing trades until Approve.
-    st.session_state.pop("run_record", None)
-    st.session_state.pop("approval", None)
 
-    try:
-        with st.spinner("The committee is meeting..."):
-            snapshot = books.take_snapshot()
-            proposal = stream_committee(snapshot, card_slots)
-            run_record = books.log_run(snapshot, proposal)
-    except Exception as error:
-        show_live_error("Run swarm", error)
+def render_order_card(
+    card_key: str,
+    title: str,
+    persona_key: str,
+    orders: list[dict] | None,
+) -> None:
+    """Draw one persona's orders: title, its limits in a line, the top 3 orders and View all for the rest."""
+    if orders is None:
+        render_pending_node(card_key, title)
         return
 
-    st.session_state["run_record"] = run_record.model_dump(mode="json")
+    with st.container(border=True, height="stretch", key=f"order_card_{card_key}"):
+        with ui.elements(key=f"order_head_{card_key}") as head:
+            with head.stack(gap="xs"):
+                head.heading(title, level=4)
+                head.text(persona_summary(persona_key), variant="muted")
+
+        if not orders:
+            ui.alert(
+                "No orders this cycle.",
+                "Each change is under $200 or already on target.",
+                key=f"no_orders_{card_key}",
+            )
+            return
+
+        rows = proposed_order_rows(orders)
+        ui.table(
+            rows[:TOP_ORDER_ROWS],
+            TOP_ORDER_COLUMNS,
+            key=f"top_orders_{card_key}",
+        )
+        if ui.button("View all", key=f"view_all_orders_{card_key}", variant="outline"):
+            show_full_table(title, rows, PROPOSED_ORDER_COLUMNS)
+
+
+def render_connector(lines: list[tuple[int, int]], is_dotted: bool = True) -> None:
+    """Draw curves from the row above (start x) down to the row below (end x), dotted or solid."""
+    middle_y = CONNECTOR_HEIGHT / 2
+    dash = 'stroke-dasharray="1 6" ' if is_dotted else ""
+
+    paths = []
+    for start_x, end_x in lines:
+        curve = (
+            f"M{start_x} 0 C{start_x} {middle_y} {end_x} {middle_y} "
+            f"{end_x} {CONNECTOR_HEIGHT}"
+        )
+        paths.append(f'<path d="{curve}" {dash}vector-effect="non-scaling-stroke" />')
+
+    # Stretched without keeping its aspect ratio, so x follows the columns.
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 {CONNECTOR_HEIGHT}" '
+        f'preserveAspectRatio="none" fill="none" stroke="{CONNECTOR_COLOR}" '
+        f'stroke-width="2" stroke-linecap="round">{"".join(paths)}</svg>'
+    )
+    # An <img>, because st.html's sanitizer strips inline <svg> tags.
+    st.html(
+        f'<img src="data:image/svg+xml,{quote(svg)}" alt="" '
+        f'style="display: block; width: 100%; height: {CONNECTOR_HEIGHT}px">'
+    )
+
+
+def center_column() -> DeltaGenerator:
+    """Return the middle half of the page, centered on the connectors' middle line."""
+    return st.columns([1, 2, 1])[1]
+
+
+def render_flow(fields: dict) -> None:
+    """Draw the committee top to bottom from Proposal-shaped JSON; a node not in `fields` yet shows a skeleton.
+
+    The three analysts converge on the PM, which branches into the three
+    personas' orders; those converge on the devil's advocate, then the
+    final verdict and, on a solid line, the recommended order.
+    """
+    orders_by_persona = fields.get("orders")
+    recommended_key = fields.get("recommended_persona")
+
+    # No gap, so each connector touches the cards above and below it.
+    with st.container(key="committee_flow", gap=None):
+        # Bottom-aligned, so all three cards end where the connector starts.
+        analyst_columns = st.columns(len(ANALYSTS), vertical_alignment="bottom")
+        for column, analyst in zip(analyst_columns, ANALYSTS, strict=True):
+            with column:
+                render_agent_node(analyst, fields.get(analyst))
+        render_connector(CONVERGE_LINES)
+        with center_column():
+            render_agent_node("pm", fields.get("pm"))
+        render_connector(BRANCH_LINES)
+
+        persona_columns = st.columns(len(config.PERSONAS))
+        for column, persona_key in zip(persona_columns, config.PERSONAS, strict=True):
+            orders = None
+            if orders_by_persona is not None:
+                orders = orders_by_persona[persona_key]
+            with column:
+                title = f"{display_name(persona_key)} orders"
+                render_order_card(persona_key, title, persona_key, orders)
+        render_connector(CONVERGE_LINES)
+
+        with center_column():
+            render_agent_node("critique", fields.get("critique"))
+        render_connector(DOWN_LINE)
+        with center_column():
+            render_agent_node("verdict", fields.get("verdict"))
+        render_connector(DOWN_LINE, is_dotted=False)
+        with center_column():
+            if recommended_key is None:
+                render_pending_node("recommended", "Recommended order")
+            else:
+                title = f"Recommended order · {display_name(recommended_key)}"
+                orders = orders_by_persona[recommended_key]
+                render_order_card("recommended", title, recommended_key, orders)
+
+
+def proposal_fields(node_update: dict) -> dict:
+    """Return one graph node's update as JSON-shaped Proposal fields, so a live run draws like a logged one."""
+    fields = {}
+    for state_key, value in node_update.items():
+        field_name = PROPOSAL_FIELD_BY_STATE_KEY.get(state_key, state_key)
+        fields[field_name] = to_jsonable_python(value)
+
+    return fields
+
+
+def stream_committee_run(question: str, model_name: str, updates: queue.Queue) -> None:
+    """Run one committee cycle and log it, putting its progress on `updates`.
+
+    Runs on a worker thread, so it makes no Streamlit call (R8): each node's
+    fields go on the queue as ("update", fields), then ("done", run_record)
+    or ("error", message). A Sonnet run is also saved as the fallback.
+    """
+    import books
+    import committee
+
+    try:
+        snapshot = books.take_snapshot()
+        # Seeded, or build_proposal would record the default question and model.
+        state = {"snapshot": snapshot, "question": question, "model_name": model_name}
+        graph_updates = committee.build_graph().stream(
+            dict(state),
+            stream_mode="updates",
+        )
+        for update in graph_updates:
+            for node_update in update.values():
+                state.update(node_update)
+                updates.put(("update", proposal_fields(node_update)))
+
+        proposal = committee.build_proposal(state)
+        run_record = books.log_run(snapshot, proposal).model_dump(mode="json")
+        if model_name.startswith(config.SONNET_DEMO_MODEL):
+            books.save_sonnet_run(run_record)
+    except Exception as error:
+        logger.error("Run swarm failed", exc_info=error)
+        updates.put(("error", f"{type(error).__name__}: {error}"))
+        return
+
+    updates.put(("done", run_record))
+
+
+def start_live_run(question: str, model_name: str) -> None:
+    """Start a committee run on a worker thread and keep its queue in the session, so every rerun keeps polling it."""
+    # A new run replaces whatever the flow showed; nothing trades until Approve.
+    for state_key in ("saved_run", "run_error", "approval"):
+        st.session_state.pop(state_key, None)
+
+    updates = queue.Queue()
+    worker = threading.Thread(
+        target=stream_committee_run,
+        args=(question, model_name, updates),
+        daemon=True,
+    )
+    worker.start()
+    st.session_state["live_run"] = {
+        "updates": updates,
+        "started_at": time.monotonic(),
+        "fields": {"question": question, "model_name": model_name},
+        "is_past_fallback": False,
+    }
+
+
+def load_saved_run() -> dict | None:
+    """Return the newest saved Sonnet run, or None when there is none or it can't be read (logged)."""
+    import books
+
+    try:
+        return books.latest_sonnet_run()
+    except Exception as error:
+        logger.error("Reading the saved Sonnet run failed", exc_info=error)
+        return None
+
+
+def end_live_run(error_message: str) -> None:
+    """Stop following a failed or stalled live run: its error shows, over the saved run when there is one."""
+    live_run = st.session_state.pop("live_run")
+    st.session_state["run_error"] = error_message
+    if not live_run["is_past_fallback"]:
+        st.session_state["saved_run"] = load_saved_run()
+
+
+def apply_live_event(live_run: dict, event_kind: str, payload: dict | str) -> bool:
+    """Apply one worker event to the session; return whether the page needs redrawing."""
+    if event_kind == "update":
+        live_run["fields"].update(payload)
+        # A saved run on screen stays until the live run finishes.
+        return st.session_state.get("saved_run") is None
+
+    if event_kind == "done":
+        del st.session_state["live_run"]
+        st.session_state.pop("saved_run", None)
+        st.session_state["committee_runs"].append(payload)
+        return True
+
+    end_live_run(payload)
+    return True
+
+
+def check_live_run_deadlines(live_run: dict, elapsed_seconds: float) -> bool:
+    """Apply the 15 s fallback and the overall ceiling; return whether the page needs redrawing."""
+    if elapsed_seconds > RUN_CEILING_SECONDS:
+        end_live_run(
+            f"No answer after {RUN_CEILING_SECONDS // 60} minutes, so the page "
+            "stopped waiting."
+        )
+        return True
+
+    if elapsed_seconds < FALLBACK_AFTER_SECONDS or live_run["is_past_fallback"]:
+        return False
+
+    live_run["is_past_fallback"] = True
+    st.session_state["saved_run"] = load_saved_run()
+    return st.session_state["saved_run"] is not None
+
+
+def drain_live_run(live_run: dict) -> bool:
+    """Apply every event the worker has queued so far; return whether the page needs redrawing."""
+    needs_redraw = False
+    while True:
+        try:
+            event_kind, payload = live_run["updates"].get_nowait()
+        except queue.Empty:
+            return needs_redraw
+
+        if apply_live_event(live_run, event_kind, payload):
+            needs_redraw = True
+
+
+@st.fragment(run_every=POLL_SECONDS)
+def follow_live_run() -> None:
+    """Poll the live run's queue and deadlines, rerunning the whole page when the flow changes.
+
+    A fragment on a timer rather than a loop, so every full run finishes:
+    Streamlit clears a run's leftover elements only once it ends.
+    """
+    live_run = st.session_state.get("live_run")
+    if live_run is None:
+        return
+
+    elapsed_seconds = time.monotonic() - live_run["started_at"]
+    model_label = config.get_model_label(live_run["fields"]["model_name"])
+    st.caption(f"The committee is meeting on {model_label}: {elapsed_seconds:.0f} s")
+
+    # A run that just ended always redraws, so its deadlines are never checked.
+    if drain_live_run(live_run) or check_live_run_deadlines(live_run, elapsed_seconds):
+        st.rerun(scope="app")
 
 
 def order_time_note(order_count: int) -> str:
@@ -751,11 +1091,34 @@ def caption_queued_lock() -> None:
         )
 
 
+def approve_choice_label(recommended_key: str, choice: str) -> str:
+    """Return an Approve option's label: "Recommended (Balanced)" or a persona's name."""
+    if choice == "recommended":
+        return f"Recommended ({display_name(recommended_key)})"
+
+    return display_name(choice)
+
+
 def approve_controls(run_record: dict) -> None:
-    """Approve executes the proposal on screen for all three personas; nothing trades before it (story 22, T18)."""
-    approve_clicked = st.button("Approve", type="primary", key="approve")
-    caption_snaptrade_order_time(run_record["proposal"]["orders"])
-    if not approve_clicked:
+    """Approve executes one persona's orders from the run on screen, the recommended one by default (story 22, T18)."""
+    proposal_fields = run_record["proposal"]
+    recommended_key = proposal_fields["recommended_persona"]
+    with ui.elements(key="approve_bar", width=APPROVE_BAR_WIDTH) as approve_bar:
+        with approve_bar.stack(direction="horizontal", align="end", gap="sm"):
+            choice_field = approve_bar.select(
+                "Orders to approve",
+                APPROVE_CHOICES,
+                key="approve_choice",
+                format_func=functools.partial(approve_choice_label, recommended_key),
+            )
+            approve_button = approve_bar.button("Approve", key="approve")
+
+    persona_key = choice_field.value
+    if persona_key == "recommended":
+        persona_key = recommended_key
+
+    caption_snaptrade_order_time({persona_key: proposal_fields["orders"][persona_key]})
+    if not approve_button.clicked:
         # Not on the click: execute re-reads the lock fresh, and a read here
         # would spend two of SnapTrade's 10 requests a minute (Risk #8).
         caption_queued_lock()
@@ -763,63 +1126,182 @@ def approve_controls(run_record: dict) -> None:
 
     from committee import Proposal
 
-    proposal = Proposal.model_validate(run_record["proposal"])
-    st.session_state["approval"] = execute_personas(
-        proposal,
-        list(config.PERSONAS),
-        tag="committee",
-    )
+    proposal = Proposal.model_validate(proposal_fields)
+    st.session_state["approval"] = {
+        "taken_at": run_record["taken_at"],
+        "persona": persona_key,
+        "outcome": execute_personas(proposal, [persona_key], tag="committee"),
+    }
     clear_rebalance_state()
 
 
-def committee_tab() -> None:
-    """Run swarm fills five agent cards live; then the PM memo, three order tables and the critic beside Approve."""
-    missing_run_keys = missing_keys(ANTHROPIC_KEY_ENV_VAR, FRED_KEY_ENV_VAR)
-    run_clicked = st.button(
-        "Run swarm",
-        type="primary",
-        disabled=bool(missing_run_keys),
-    )
-    if missing_run_keys:
-        st.caption(f"Run swarm needs {' and '.join(missing_run_keys)} in .env.")
-
-    # Lay out every slot first, so cards fill in place while the graph streams.
-    card_slots = {}
-    for analyst, column in zip(ANALYSTS, st.columns(len(ANALYSTS)), strict=True):
-        card_slots[analyst] = column.empty()
-    card_slots["pm"] = st.empty()
-    orders_area = st.container()
-    critic_column, approve_column = st.columns([2, 1])
-    card_slots["critique"] = critic_column.empty()
-
-    if run_clicked:
-        run_swarm(card_slots)
-
-    run_record = st.session_state.get("run_record")
-    if run_record is None:
-        st.info("Press Run swarm to convene the committee.")
+def render_approval_section(run_record: dict, is_approvable: bool) -> None:
+    """Show Approve for the latest or the saved run, then what it executed; an older run only says where Approve is."""
+    if not is_approvable:
+        st.caption("Approve works on the latest run: pick it under Previous runs.")
         return
 
-    proposal = run_record["proposal"]
-    for card, slot in card_slots.items():
-        render_card(slot, card, proposal[card])
-    with orders_area:
-        render_persona_orders(proposal["orders"])
-    with approve_column:
-        approve_controls(run_record)
-
+    approve_controls(run_record)
     approval = st.session_state.get("approval")
-    if approval is None:
+    if approval is None or approval["taken_at"] != run_record["taken_at"]:
         return
 
-    st.subheader("Execution")
-    columns = st.columns(len(config.PERSONAS))
-    for column, (persona_key, persona) in zip(
-        columns, config.PERSONAS.items(), strict=True
-    ):
-        with column:
-            st.markdown(f"**{persona.display_name}**")
-            render_execution(persona_key, approval)
+    with ui.elements(key="execution_heading") as heading:
+        heading.heading(f"Execution · {display_name(approval['persona'])}", level=4)
+    render_execution(approval["persona"], approval["outcome"])
+
+
+def render_prompt_bar(is_running: bool) -> tuple[str, str, bool]:
+    """Draw the model, the question and Run swarm in one row; return the question, the model id and whether Run swarm was clicked.
+
+    The question and Run swarm share one shadcn tree, so the click also
+    commits a question typed just before it. The model sits apart because
+    a tree shares its width equally between fields; a select commits as
+    soon as it changes.
+    """
+    missing_run_keys = missing_keys(ANTHROPIC_KEY_ENV_VAR, FRED_KEY_ENV_VAR)
+    model_labels = list(config.MODEL_CHOICES)
+    default_label = config.get_model_label(config.get_model_name())
+    if default_label not in model_labels:
+        default_label = None
+
+    with st.container(horizontal=True):
+        model_label = ui.select(
+            "Model",
+            model_labels,
+            value=default_label,
+            key="model",
+            width=MODEL_SELECT_WIDTH,
+        )
+        with ui.elements(key="prompt_bar") as prompt:
+            with prompt.stack(gap="xs"):
+                with prompt.stack(direction="horizontal", align="end", gap="sm"):
+                    question_field = prompt.input(
+                        "Question",
+                        config.DEFAULT_QUESTION,
+                        key="question",
+                    )
+                    run_button = prompt.button(
+                        "Run swarm",
+                        key="run_swarm",
+                        disabled=bool(missing_run_keys) or is_running,
+                        loading=is_running,
+                    )
+                if missing_run_keys:
+                    prompt.text(
+                        f"Run swarm needs {' and '.join(missing_run_keys)} in .env.",
+                        variant="caption",
+                    )
+
+    # A question backspaced to nothing asks the default one.
+    question = (question_field.value or "").strip() or config.DEFAULT_QUESTION
+    return question, config.MODEL_CHOICES[model_label], run_button.clicked
+
+
+def run_label(record: dict) -> str:
+    """Return a run's picker label, e.g. "September 27, 2026, 10:42 · Sonnet 5 · <question>"; a saved Sonnet run says so."""
+    proposal = record["proposal"]
+    label = " · ".join(
+        [
+            format_long_time(record["taken_at"]),
+            config.get_model_label(proposal["model_name"]),
+            textwrap.shorten(proposal["question"], 60, placeholder="…"),
+        ]
+    )
+    # Only a saved Sonnet run carries saved_at.
+    if "saved_at" in record:
+        return f"Saved Sonnet run · {label}"
+
+    return label
+
+
+def render_previous_runs(
+    records: list[dict],
+    is_disabled: bool,
+    is_preselected: bool,
+) -> dict | None:
+    """Draw the Previous runs select over `records` (newest first); return the picked run, or None when none is."""
+    if not records:
+        return None
+
+    choices = []
+    for index, record in enumerate(records):
+        choices.append(ui.Choice(value=index, label=run_label(record)))
+
+    # A new key whenever a run or a saved run joins the top of the list (or
+    # a failure clears the pick) resets the pick.
+    list_state = f"{records[0]['taken_at']}_{len(records)}_{is_preselected}"
+    picked_index = ui.select(
+        "Previous runs",
+        choices,
+        index=0 if is_preselected else None,
+        key=f"previous_runs_{list_state}",
+        placeholder="Pick a previous run",
+        disabled=is_disabled,
+    )
+    if picked_index is None:
+        return None
+
+    return records[picked_index]
+
+
+def render_saved_run_label(saved_run: dict, is_running: bool) -> None:
+    """Say plainly that the flow shows the saved Sonnet run, and whether the live run may still replace it."""
+    title = (
+        f"Saved Sonnet run from {format_long_time(saved_run['taken_at'])} · "
+        f"question: {saved_run['proposal']['question']}"
+    )
+    description = None
+    if is_running:
+        description = (
+            "The live run is still going; it replaces this one when it finishes."
+        )
+
+    ui.alert(title, description, key="saved_run_label")
+
+
+def committee_tab() -> None:
+    """Ask the committee a question on a chosen model, watch the swarm fill its flow live, then approve one persona (S11)."""
+    with ui.elements(key="committee_intro") as intro:
+        intro.text(COMMITTEE_INTRO, variant="muted")
+
+    # This session's finished runs, oldest first; nothing outlives the session.
+    runs = st.session_state.setdefault("committee_runs", [])
+    live_run = st.session_state.get("live_run")
+    question, model_name, run_clicked = render_prompt_bar(
+        is_running=live_run is not None
+    )
+    if run_clicked:
+        start_live_run(question, model_name)
+        st.rerun()
+
+    if live_run is not None:
+        follow_live_run()
+
+    run_error = st.session_state.get("run_error")
+    if run_error is not None:
+        ui.alert("Run swarm failed", run_error, variant="destructive", key="run_error")
+
+    saved_run = st.session_state.get("saved_run")
+    records = runs[::-1]
+    if saved_run is not None:
+        records.insert(0, saved_run)
+    # After a failed run with nothing saved, the flow stays empty until a pick.
+    is_preselected = run_error is None or saved_run is not None
+    picked_run = render_previous_runs(records, live_run is not None, is_preselected)
+
+    if live_run is not None and saved_run is None:
+        render_flow(live_run["fields"])
+    elif picked_run is None:
+        if not records:
+            ui.alert("Press Run swarm to convene the committee.", key="committee_empty")
+        render_flow({})
+    else:
+        if picked_run is saved_run:
+            render_saved_run_label(saved_run, is_running=live_run is not None)
+        render_flow(picked_run["proposal"])
+        is_approvable = picked_run is saved_run or picked_run is runs[-1]
+        render_approval_section(picked_run, is_approvable)
 
 
 def holdings_rows(book: Book, marks: dict[str, float], equity: float) -> list[dict]:
@@ -1249,6 +1731,12 @@ def format_long_date(timestamp: str | None) -> str:
     return f"{moment:%B} {moment.day}, {moment.year}"
 
 
+def format_long_time(timestamp: str) -> str:
+    """Return an ISO timestamp in local time as e.g. "September 27, 2026, 10:42"."""
+    moment = datetime.fromisoformat(timestamp).astimezone()
+    return f"{format_long_date(moment.isoformat())}, {moment:%H:%M}"
+
+
 def format_money(amount: float | None) -> str:
     """Return a dollar amount as e.g. "$1,234.56" or "-$12.00", or "" when missing."""
     if amount is None:
@@ -1365,13 +1853,13 @@ def configured_brokerages() -> list[tuple[str, str]]:
     return brokerages
 
 
-def show_full_activity(brokerage_name: str, rows: list[dict], columns: list) -> None:
-    """Open a popup with the brokerage's whole activity table."""
+def show_full_table(title: str, rows: list[dict], columns: list) -> None:
+    """Open a popup with a whole table: a brokerage's activity or a persona's orders."""
 
     def render_table() -> None:
-        ui.table(rows, columns, key="full_activity", max_height=520)
+        ui.table(rows, columns, key="full_table", max_height=520)
 
-    st.dialog(f"{brokerage_name} activity", width="large")(render_table)()
+    st.dialog(title, width="large")(render_table)()
 
 
 def render_brokerage_card(
@@ -1418,7 +1906,7 @@ def render_brokerage_card(
 
         ui.table(rows[:RECENT_ACTIVITY_ROWS], columns, key=f"recent_{kind}")
         if ui.button("View all", key=f"view_all_{kind}", variant="outline"):
-            show_full_activity(name, rows, columns)
+            show_full_table(f"{name} activity", rows, columns)
 
 
 def home_page() -> None:
