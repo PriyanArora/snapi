@@ -89,6 +89,16 @@ def is_alpaca_paper_configured() -> bool:
     return all(os.environ.get(name) for name in required_env_vars)
 
 
+def is_sandbox_configured() -> bool:
+    """Return True when the key and the Sandbox account id are all set in the environment."""
+    required_env_vars = (
+        CONSUMER_KEY_ENV_VAR,
+        CLIENT_ID_ENV_VAR,
+        SANDBOX_ACCOUNT_ENV_VAR,
+    )
+    return all(os.environ.get(name) for name in required_env_vars)
+
+
 def alpaca_paper_account_id() -> str:
     """Return Balanced's Alpaca Paper account id (found once with `python brokerage.py`)."""
     return os.environ[ALPACA_PAPER_ACCOUNT_ENV_VAR]

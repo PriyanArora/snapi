@@ -177,7 +177,8 @@ SONNET_DEMO_MODEL = "claude-sonnet-5"
 
 def get_model_name() -> str:
     """Return the LLM model id, from SNAPI_MODEL or the Haiku 4.5 default."""
-    return os.environ.get(SNAPI_MODEL_ENV_VAR, DEFAULT_MODEL)
+    # `or`, not a get() default: .env.example's empty SNAPI_MODEL= loads as "".
+    return os.environ.get(SNAPI_MODEL_ENV_VAR) or DEFAULT_MODEL
 
 
 # Disclaimer (Q13), shown on the gate screen and the closing slide verbatim.
