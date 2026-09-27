@@ -1,4 +1,4 @@
-"""snapi's Streamlit app: the password gate and the dashboard tabs (PRD Streamlit app).
+"""snapi's Streamlit app: the login page, the navbar and its pages (PRD Streamlit app).
 
 Heavy modules (books, committee, execute, brokerage and everything they pull
 in: langgraph, langchain, snaptrade, external/) are imported inside the live
@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from langchain_core.runnables import Runnable
     from streamlit.delta_generator import DeltaGenerator
 
+    from brokerage import AccountSnapshot
     from committee import Proposal, Snapshot
     from portfolio import Book, RebalanceResult
 
@@ -43,27 +44,24 @@ logger = logging.getLogger(__name__)
 
 APP_PASSWORD_ENV_VAR = "APP_PASSWORD"
 
+USER_FIRST_NAME = "Priyan"
 TAGLINE = "Turn your brokerage into your own AI hedge fund"
 LOGIN_CARD_WIDTH = 400
-# The page font comes from .streamlit/config.toml. shadcn sets its own font on
-# its component root, so the host inherits the page font instead.
-SITE_CSS = "<style>[data-ssui-v2-host] { font-family: inherit; }</style>"
-LOGO_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@1,800&display=swap');
-.snapi-logo {
-  font-family: 'Playfair Display', serif;
-  font-style: italic;
-  font-weight: 800;
-  font-size: 5rem;
-  line-height: 1;
-  letter-spacing: -0.02em;
-  text-align: center;
-  color: #0F1B3D;
-}
-"""
-# Login background: soft grain over blue-teal glows on the off-white page.
-# The SVG is URL-encoded because Streamlit's HTML sanitizer drops a <style>
-# block that holds a raw <svg> tag.
+HOME_PAGE = "Home"
+# The navbar's links, in the Q12 demo order; the logo leads Home.
+NAV_PAGES = ("Committee", "Portfolio", "Chat", "Forward test", "Backtest")
+RECENT_ACTIVITY_ROWS = 5
+# Fits the five links; a "content" width measures the shadcn root before
+# its buttons render, so the links spilled out of the navbar.
+NAV_LINKS_WIDTH = 500
+# SnapTrade codes whose sentence-case form reads badly.
+ACTIVITY_TYPE_LABELS = {"REI": "Dividend reinvestment"}
+LOGO_FONT_URL = (
+    "https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@1,800"
+    "&display=swap"
+)
+# Background grain. The SVG is URL-encoded because Streamlit's HTML sanitizer
+# drops a <style> block that holds a raw <svg> tag.
 GRAIN_SVG = (
     "<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'>"
     "<filter id='g'><feTurbulence type='fractalNoise' baseFrequency='.8' "
@@ -71,8 +69,12 @@ GRAIN_SVG = (
     "<feColorMatrix values='0 0 0 0 .25  0 0 0 0 .4  0 0 0 0 .45  1.5 0 0 0 -1'/>"
     "</filter><rect width='100%' height='100%' filter='url(#g)'/></svg>"
 )
-LOGIN_PAGE_CSS = f"""
+# Every page: soft grain over blue-teal glows on the off-white theme, and the
+# logo font. The page font comes from .streamlit/config.toml; shadcn sets its
+# own font on its component root, so the host inherits the page font instead.
+SITE_CSS = f"""
 <style>
+@import url('{LOGO_FONT_URL}');
 .stApp {{
   background-color: #F4F6F8;
   background-image:
@@ -84,7 +86,77 @@ LOGIN_PAGE_CSS = f"""
   background-attachment: fixed;
 }}
 header[data-testid="stHeader"] {{ background: transparent; }}
-[data-testid="stMainBlockContainer"] {{ padding-top: 14vh; }}
+[data-ssui-v2-host] {{ font-family: inherit; }}
+.snapi-logo {{
+  font-family: 'Playfair Display', serif;
+  font-style: italic;
+  font-weight: 800;
+  font-size: 5rem;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  text-align: center;
+  color: #0F1B3D;
+}}
+</style>
+"""
+LOGIN_PAGE_CSS = (
+    '<style>[data-testid="stMainBlockContainer"] { padding-top: 14vh; }</style>'
+)
+# After login: a glassy navbar that stays on top, the logo as a shadcn ghost
+# button themed through its own tokens, and the Home page's big type.
+APP_CSS = """
+<style>
+header[data-testid="stHeader"] { display: none; }
+[data-testid="stMainBlockContainer"] { padding-top: 1rem; }
+[data-testid="stLayoutWrapper"]:has(> .st-key-navbar) {
+  position: sticky;
+  top: 0.75rem;
+  z-index: 999;
+}
+.st-key-navbar {
+  padding: 0.35rem 0.75rem;
+  background: rgba(255, 255, 255, 0.55);
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  border: 1px solid rgba(15, 27, 61, 0.08);
+  border-radius: 16px;
+  box-shadow: 0 8px 24px rgba(15, 27, 61, 0.06);
+}
+.st-key-nav_logo [data-ssui-v2-host] {
+  font-family: 'Playfair Display', serif;
+  font-style: italic;
+  --text-sm: 1.9rem;
+  --text-sm--line-height: 1;
+  --font-weight-medium: 800;
+  --spacing: 0.3rem;
+}
+[class*="st-key-brokerage_card_"] {
+  background: rgba(255, 255, 255, 0.7);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-radius: 14px;
+}
+.snapi-hero { margin: 4rem 0 0; }
+.snapi-hero h1 {
+  margin: 0;
+  padding: 0;
+  font-size: clamp(2.2rem, 4.2vw, 3.75rem);
+  font-weight: 800;
+  line-height: 1.08;
+  letter-spacing: -0.03em;
+  color: #0F1B3D;
+}
+.snapi-hero h1 span { display: block; color: #56637F; font-weight: 700; }
+.snapi-total { margin: 2.5rem 0 2rem; }
+.snapi-total p { margin: 0; color: #56637F; font-weight: 600; }
+.snapi-total strong {
+  display: block;
+  font-size: clamp(2.5rem, 5vw, 4.25rem);
+  font-weight: 800;
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+  color: #0F1B3D;
+}
 </style>
 """
 
@@ -100,10 +172,6 @@ SANDBOX_SETUP_NOTE = (
     "SNAPTRADE_SANDBOX_ACCOUNT_ID in .env to show the Sandbox's demo holdings."
 )
 
-ACTIVITY_SETUP_NOTE = (
-    "The Activity tab needs SNAPTRADE_CONSUMER_KEY, SNAPTRADE_CLIENT_ID, "
-    "SNAPTRADE_SANDBOX_ACCOUNT_ID and SNAPTRADE_ALPACA_PAPER_ACCOUNT_ID in .env."
-)
 CHAT_SETUP_NOTE = (
     "The chat needs ANTHROPIC_API_KEY, SNAPTRADE_MCP_URL and "
     "SNAPTRADE_MCP_OAUTH_TOKEN (minted by hand, R6) in .env."
@@ -124,13 +192,6 @@ CHAT_PLACEHOLDER = "Ask about your portfolio, e.g. What's my largest sector expo
 BACKTEST_SETUP_NOTE = (
     "Run `uv run python backtest.py` (needs FRED_API_KEY) to generate the backtest."
 )
-
-# Cash dividends. REI (reinvestment) pairs with a DIVIDEND row, so counting
-# it too would double the income.
-DIVIDEND_TYPES = frozenset({"DIVIDEND", "SUBSTITUTE_DIVIDEND"})
-# Trades start hidden: Q11's table is dividends, splits, mergers and
-# transfers. The type filter can add them back.
-TRADE_TYPES = frozenset({"BUY", "SELL"})
 
 NEW_YORK = ZoneInfo("America/New_York")
 SATURDAY = 5  # datetime.weekday(): Monday is 0
@@ -201,23 +262,30 @@ def is_password_correct(entered_password: str) -> bool:
 
 def render_logo() -> None:
     """Draw the Snapi wordmark in its serif italic logo font."""
-    st.html(f'<style>{LOGO_CSS}</style><div class="snapi-logo">Snapi</div>')
+    st.html('<div class="snapi-logo">Snapi</div>')
 
 
 def render_login_card() -> tuple[str, bool]:
     """Draw the shadcn tagline and password card; return the typed password and whether it was submitted."""
+    is_password_shown = st.session_state.get("show_password", False)
     with ui.elements(key="login", width=LOGIN_CARD_WIDTH) as login:
         with login.stack(gap="lg"):
             with login.stack(align="center"):
                 login.text(TAGLINE, variant="muted")
             with login.card():
                 with login.card_content():
-                    password_field = login.input(
-                        "Password",
-                        key="password",
-                        type="password",
-                        placeholder="Enter the app password",
-                    )
+                    with login.stack(direction="horizontal", align="end", gap="sm"):
+                        password_field = login.input(
+                            "Password",
+                            key="password",
+                            type="text" if is_password_shown else "password",
+                            placeholder="Enter the app password",
+                        )
+                        show_button = login.button(
+                            "Hide" if is_password_shown else "Show",
+                            key="show_password",
+                            variant="outline",
+                        )
                 with login.card_footer():
                     with login.stack(gap="md"):
                         continue_button = login.button(
@@ -228,16 +296,21 @@ def render_login_card() -> tuple[str, bool]:
                         login.text(config.DISCLAIMER, variant="caption")
 
     entered_password = password_field.value or ""
-    # Enter commits the field without a click, so a typed value is a submit too.
-    is_submitted = continue_button.clicked or bool(entered_password)
+    # Enter commits the field without a click, so a newly committed value is a
+    # submit too. A value already seen (Show/Hide committed it) is not.
+    is_new_value = entered_password != st.session_state.get("seen_password", "")
+    st.session_state["seen_password"] = entered_password
+    if show_button.clicked:
+        st.session_state["show_password"] = not is_password_shown
+        st.rerun()
+
+    is_submitted = continue_button.clicked or (bool(entered_password) and is_new_value)
     return entered_password, is_submitted
 
 
 def check_password() -> None:
     """Show the login page and stop the script until the password matches APP_PASSWORD (S9, T17, Q13)."""
     if st.session_state.get("password_ok"):
-        st.title("snapi")
-        st.caption(config.DISCLAIMER)
         return
 
     st.html(LOGIN_PAGE_CSS)
@@ -258,6 +331,7 @@ def check_password() -> None:
 
         if is_password_correct(entered_password):
             st.session_state["password_ok"] = True
+            del st.session_state["seen_password"]
             st.rerun()
 
         ui.alert(
@@ -932,7 +1006,7 @@ def sandbox_panel() -> None:
     """Read the Sandbox holdings through the shared 60 s SnapTrade cache and show them, or say why not."""
     import brokerage
 
-    st.subheader("SnapTrade Sandbox (demo data)")
+    st.subheader("SnapTrade Sandbox")
     if not brokerage.is_sandbox_configured():
         st.caption(SANDBOX_SETUP_NOTE)
         return
@@ -1120,78 +1194,260 @@ def backtest_tab() -> None:
     st.dataframe(backtest_metric_rows(results["metrics"]), hide_index=True)
 
 
-def dividend_income(activities: list[dict]) -> float:
-    """Return the cash dividends paid across the activity rows."""
-    income = 0.0
-    for activity in activities:
-        if activity["type"] in DIVIDEND_TYPES:
-            income += activity["amount"] or 0.0
+def format_long_date(timestamp: str | None) -> str:
+    """Return an ISO date or timestamp as e.g. "September 29, 2026", or "" when missing."""
+    if not timestamp:
+        return ""
 
-    return income
-
-
-def render_sandbox_activities(activities: list[dict]) -> None:
-    """Show dividend income and the Sandbox's activity rows, newest first, filtered by type (S12, Q11)."""
-    st.subheader("SnapTrade Sandbox activity (demo data)")
-    st.metric("Dividend income", f"${dividend_income(activities):,.2f}")
-
-    # SnapTrade's type is a best-effort string with no merger value, so
-    # the filter offers whatever types the data holds.
-    present_types = sorted({activity["type"] for activity in activities})
-    default_types = [name for name in present_types if name not in TRADE_TYPES]
-    chosen_types = st.multiselect(
-        "Types",
-        present_types,
-        default=default_types,
-        key="activity_types",
-    )
-
-    # SnapTrade already returns activities newest first.
-    shown = [activity for activity in activities if activity["type"] in chosen_types]
-    if not shown:
-        st.caption("No activity of the chosen types.")
-        return
-
-    st.dataframe(shown, hide_index=True)
+    moment = datetime.fromisoformat(timestamp)
+    return f"{moment:%B} {moment.day}, {moment.year}"
 
 
-def render_alpaca_orders(orders: list[dict]) -> None:
-    """Show Balanced's Alpaca Paper orders from the last 24 h with their status, newest first."""
-    st.subheader("Alpaca Paper order history (last 24 h)")
-    st.caption(
-        "Alpaca Paper doesn't simulate dividends, so income shows for the Sandbox only."
-    )
-    if not orders:
-        st.caption("No orders in the last 24 hours.")
-        return
+def format_money(amount: float | None) -> str:
+    """Return a dollar amount as e.g. "$1,234.56" or "-$12.00", or "" when missing."""
+    if amount is None:
+        return ""
 
-    newest_first = sorted(
-        orders, key=lambda order: order["time_placed"] or "", reverse=True
-    )
-    st.dataframe(newest_first, hide_index=True)
+    sign = "-" if amount < 0 else ""
+    return f"{sign}${abs(amount):,.2f}"
 
 
-def activity_tab() -> None:
-    """Show SnapTrade Sandbox activity and Alpaca Paper order history, read-only (S12, story 40)."""
+def format_label(value: str | None) -> str:
+    """Return SnapTrade's upper-case codes as sentence case, e.g. PARTIAL_CANCELED -> Partial canceled."""
+    return (value or "").replace("_", " ").capitalize()
+
+
+def format_quantity(quantity: float | None) -> str:
+    """Return a share count without a trailing .0, or "" when missing."""
+    if quantity is None:
+        return ""
+
+    return f"{quantity:g}"
+
+
+def account_value(snapshot: AccountSnapshot) -> float:
+    """Return cash plus every holding at SnapTrade's last price; a holding without a price adds nothing."""
+    holdings_value = 0.0
+    for holding in snapshot.holdings:
+        if holding.price is not None:
+            holdings_value += holding.units * holding.price
+
+    return snapshot.cash + holdings_value
+
+
+ORDER_COLUMNS = [
+    ui.TableColumn(key="date", label="Date"),
+    ui.TableColumn(key="action", label="Action"),
+    ui.TableColumn(key="ticker", label="Ticker"),
+    ui.TableColumn(key="quantity", label="Shares", align="right"),
+    ui.TableColumn(key="price", label="Price", align="right"),
+    ui.TableColumn(key="status", label="Status"),
+]
+ACTIVITY_COLUMNS = [
+    ui.TableColumn(key="date", label="Date"),
+    ui.TableColumn(key="type", label="Type"),
+    ui.TableColumn(key="ticker", label="Ticker"),
+    ui.TableColumn(key="units", label="Units", align="right"),
+    ui.TableColumn(key="amount", label="Amount", align="right"),
+]
+
+
+def order_table_row(order: dict) -> dict[str, str]:
+    """Turn one SnapTrade order row into the Home table's display row."""
+    return {
+        "date": format_long_date(order["time_placed"]),
+        "action": format_label(order["action"]),
+        "ticker": order["ticker"] or "",
+        "quantity": format_quantity(order["total_quantity"]),
+        "price": format_money(order["execution_price"]),
+        "status": format_label(order["status"]),
+    }
+
+
+def activity_table_row(activity: dict) -> dict[str, str]:
+    """Turn one SnapTrade activity row into the Home table's display row."""
+    return {
+        "date": format_long_date(activity["date"]),
+        "type": ACTIVITY_TYPE_LABELS.get(
+            activity["type"], format_label(activity["type"])
+        ),
+        "ticker": activity["ticker"] or "",
+        "units": format_quantity(activity["units"]),
+        "amount": format_money(activity["amount"]),
+    }
+
+
+def read_alpaca_orders(account_id: str) -> list[dict[str, str]]:
+    """Return Alpaca Paper's orders from the last 90 days as display rows, newest first.
+
+    The 90-day list refreshes about daily, so the realtime last-24h read
+    adds today's orders and wins on status.
+    """
     import brokerage
 
-    if not (
-        brokerage.is_sandbox_configured() and brokerage.is_alpaca_paper_configured()
-    ):
-        st.info(ACTIVITY_SETUP_NOTE)
+    orders_by_id = {}
+    recent_orders = brokerage.get_recent_orders(account_id)
+    for order in [*brokerage.get_order_history(account_id), *recent_orders]:
+        orders_by_id[order["brokerage_order_id"]] = order
+
+    newest_first = sorted(
+        orders_by_id.values(),
+        key=lambda order: order["time_placed"] or "",
+        reverse=True,
+    )
+    return [order_table_row(order) for order in newest_first]
+
+
+def read_sandbox_activity(account_id: str) -> list[dict[str, str]]:
+    """Return the Sandbox's activity (trades, dividends, splits, transfers) as display rows, newest first."""
+    import brokerage
+
+    # SnapTrade already returns activities newest first.
+    activities = brokerage.get_activities(account_id)
+    return [activity_table_row(activity) for activity in activities]
+
+
+def configured_brokerages() -> list[tuple[str, str]]:
+    """Return (kind, account id) for each connected account set in .env: "alpaca" and "sandbox"."""
+    import brokerage
+
+    brokerages = []
+    if brokerage.is_alpaca_paper_configured():
+        brokerages.append(("alpaca", brokerage.alpaca_paper_account_id()))
+    if brokerage.is_sandbox_configured():
+        brokerages.append(("sandbox", brokerage.sandbox_account_id()))
+    return brokerages
+
+
+def show_full_activity(brokerage_name: str, rows: list[dict], columns: list) -> None:
+    """Open a popup with the brokerage's whole activity table."""
+
+    def render_table() -> None:
+        ui.table(rows, columns, key="full_activity", max_height=520)
+
+    st.dialog(f"{brokerage_name} activity", width="large")(render_table)()
+
+
+def render_brokerage_card(
+    kind: str,
+    account_id: str,
+    connection: dict,
+    value: float,
+) -> None:
+    """Draw one connected brokerage: logo, name, access, balance, its 5 latest rows and View all."""
+    name = connection.get("name") or kind.title()
+    access = "Trade" if connection.get("access") == "trade" else "Read-only"
+    with st.container(border=True, key=f"brokerage_card_{kind}"):
+        with st.container(horizontal=True, vertical_alignment="center"):
+            ui.avatar(
+                connection.get("logo_url"),
+                fallback=name[:2].upper(),
+                alt=name,
+                size="lg",
+                key=f"logo_{kind}",
+            )
+            with ui.elements(key=f"brokerage_head_{kind}") as head:
+                with head.stack(
+                    direction="horizontal", justify="between", align="center"
+                ):
+                    with head.stack(gap="xs"):
+                        head.heading(name, level=4)
+                        head.badge(access, variant="secondary")
+                    head.heading(format_money(value), level=3)
+
+        try:
+            if kind == "alpaca":
+                rows = read_alpaca_orders(account_id)
+                columns = ORDER_COLUMNS
+            else:
+                rows = read_sandbox_activity(account_id)
+                columns = ACTIVITY_COLUMNS
+        except Exception as error:
+            show_live_error(f"Reading {name} activity", error)
+            return
+
+        if not rows:
+            ui.alert("No activity yet.", "Trades show here once they're placed.")
+            return
+
+        ui.table(rows[:RECENT_ACTIVITY_ROWS], columns, key=f"recent_{kind}")
+        if ui.button("View all", key=f"view_all_{kind}", variant="outline"):
+            show_full_activity(name, rows, columns)
+
+
+def home_page() -> None:
+    """Greet the user, then show the live total and each connected brokerage's balance and activity (S12)."""
+    import brokerage
+
+    st.html(
+        f'<div class="snapi-hero"><h1>Hello {USER_FIRST_NAME},'
+        "<span>Here is your overall portfolio across all brokerage accounts.</span>"
+        "</h1></div>"
+    )
+    brokerages = configured_brokerages()
+    if not brokerages:
+        st.info(SNAPTRADE_SETUP_NOTE)
         return
 
-    # Both reads go through the 60 s cache. Recent orders is the same
-    # all-status read the R4 lock uses, so queued orders show their status (Q11).
     try:
-        activities = brokerage.get_activities(brokerage.sandbox_account_id())
-        orders = brokerage.get_recent_orders(brokerage.alpaca_paper_account_id())
+        connections = brokerage.get_connections()
+        values_by_account = {}
+        for _, account_id in brokerages:
+            snapshot = brokerage.get_account_snapshot(account_id)
+            values_by_account[account_id] = account_value(snapshot)
     except Exception as error:
-        show_live_error("Reading SnapTrade activity", error)
+        show_live_error("Reading your brokerage accounts", error)
         return
 
-    render_sandbox_activities(activities)
-    render_alpaca_orders(orders)
+    total_value = sum(values_by_account.values())
+    st.html(
+        '<div class="snapi-total"><p>Total balance, live</p>'
+        f"<strong>{format_money(total_value)}</strong></div>"
+    )
+    with ui.elements(key="connected_heading") as heading:
+        heading.heading("Connected brokerages", level=3)
+        heading.text(f"{len(brokerages)} connections", variant="muted")
+
+    for column, (kind, account_id) in zip(
+        st.columns(len(brokerages)), brokerages, strict=True
+    ):
+        with column:
+            render_brokerage_card(
+                kind,
+                account_id,
+                connections.get(account_id, {}),
+                values_by_account[account_id],
+            )
+
+
+def render_navbar(current_page: str) -> str:
+    """Draw the glassy shadcn navbar; return the page the user picked, else the current one."""
+    picked_page = current_page
+    with st.container(
+        key="navbar",
+        horizontal=True,
+        horizontal_alignment="distribute",
+        vertical_alignment="center",
+    ):
+        with st.container(key="nav_logo", width="content"):
+            if ui.button("Snapi", key="nav_logo_button", variant="ghost"):
+                picked_page = HOME_PAGE
+
+        link_buttons = {}
+        with ui.elements(key="nav_links", width=NAV_LINKS_WIDTH) as nav:
+            with nav.stack(direction="horizontal", gap="xs"):
+                for page_name in NAV_PAGES:
+                    variant = "secondary" if page_name == current_page else "ghost"
+                    link_buttons[page_name] = nav.button(
+                        page_name,
+                        key=f"nav_{page_name.lower().replace(' ', '_')}",
+                        variant=variant,
+                    )
+
+    for page_name, link_button in link_buttons.items():
+        if link_button.clicked:
+            picked_page = page_name
+    return picked_page
 
 
 def is_chat_configured() -> bool:
@@ -1274,7 +1530,7 @@ def chat_tab() -> None:
 
 
 def main() -> None:
-    """Render the gated app; tabs follow the Q12 demo narrative."""
+    """Render the login page, then the navbar and one page at a time (Q12 demo order)."""
     st.set_page_config(page_title="snapi", layout="wide")
     st.html(SITE_CSS)
     # Cloud's root-level Secrets reach os.environ only once st.secrets is
@@ -1283,36 +1539,24 @@ def main() -> None:
     st.secrets.load_if_toml_exists()
     load_dotenv()  # .env fills in only what isn't set already
     check_password()
-    prepare_live_books()
+    st.html(APP_CSS)
 
-    tab_labels = [
-        "Committee",
-        "Portfolio",
-        "Activity",
-        "Chat",
-        "Forward test",
-        "Backtest",
-    ]
-    (
-        committee_area,
-        portfolio_area,
-        activity_area,
-        chat_area,
-        forward_test_area,
-        backtest_area,
-    ) = st.tabs(tab_labels)
-    with committee_area:
-        committee_tab()
-    with portfolio_area:
-        portfolio_tab()
-    with activity_area:
-        activity_tab()
-    with chat_area:
-        chat_tab()
-    with forward_test_area:
-        forward_test_tab()
-    with backtest_area:
-        backtest_tab()
+    page_renderers = {
+        HOME_PAGE: home_page,
+        "Committee": committee_tab,
+        "Portfolio": portfolio_tab,
+        "Chat": chat_tab,
+        "Forward test": forward_test_tab,
+        "Backtest": backtest_tab,
+    }
+    current_page = st.session_state.get("page", HOME_PAGE)
+    picked_page = render_navbar(current_page)
+    if picked_page != current_page:
+        st.session_state["page"] = picked_page
+        st.rerun()
+
+    prepare_live_books()
+    page_renderers[current_page]()
 
 
 if __name__ == "__main__":
