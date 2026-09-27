@@ -160,9 +160,9 @@ def execute(
     target_weights = proposal.target_weights[persona_key]
     marks = prices.latest_marks()
 
-    # The proposal is read back from the run log on disk. Targets above the
-    # persona's max invested % could only come from a corrupt or hand-edited
-    # line, and would spend cash the book doesn't have.
+    # Approve executes a proposal after a JSON round trip through the
+    # session. Targets above the persona's max invested % could only come
+    # from a bug upstream, and would spend cash the book doesn't have.
     gross_weight = sum(target_weights.values())
     if gross_weight > persona.max_invested_pct + GROSS_WEIGHT_TOLERANCE:
         raise ValueError(
