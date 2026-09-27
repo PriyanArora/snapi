@@ -4,12 +4,15 @@ Setup: a fixed committed snapshot fixture and a fake chat model returning
 canned structured outputs. Checks the outcomes a user would notice at this
 seam: every persona's sector cap, per-name max and cash buffer hold on the
 book the proposed orders actually produce, a raising analyst abstains
-without sinking the run, the verdict's persona is the one recommended, and
-a saved Sonnet run reads back intact.
+without sinking the run, the verdict's persona is the one recommended,
+a saved Sonnet run reads back intact, and the app's live-run worker queues
+every node before the logged run.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import queue
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +20,7 @@ from pathlib import Path
 import pytest
 from langchain_core.messages import AIMessage
 
+import app
 import books
 import committee
 import config
@@ -330,3 +334,48 @@ def test_a_saved_sonnet_run_reads_back(
 
     assert "saved_at" in saved_run
     assert Proposal.model_validate(saved_run["proposal"]) == proposal
+
+
+def _snapshot_with_spy() -> Snapshot:
+    """Return the fixture snapshot with SPY marked too, since logging a run reads its close."""
+    return dataclasses.replace(
+        _fixture_snapshot(),
+        marks=FIXTURE_MARKS | {config.BENCHMARK: 500.0},
+    )
+
+
+def test_a_live_run_queues_every_node_then_the_logged_run(
+    use_fake_model: Callable,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The worker queues each node's fields, then the run it logged with this question and model, saved as the Sonnet fallback."""
+    monkeypatch.delenv(books.MONGODB_URI_ENV_VAR, raising=False)
+    monkeypatch.setattr(books, "RUN_LOG_PATH", tmp_path / "run_log.jsonl")
+    monkeypatch.setattr(books, "SONNET_RUNS_PATH", tmp_path / "sonnet_runs.jsonl")
+    monkeypatch.setattr(books, "take_snapshot", _snapshot_with_spy)
+    use_fake_model(
+        {
+            SentimentAnswer: SENTIMENT_ANSWER,
+            Narration: NARRATION_ANSWER,
+            PMView: PM_ANSWER,
+            CriticNotes: CRITIC_ANSWER,
+            Verdict: VERDICT_ANSWER,
+        }
+    )
+    updates = queue.Queue()
+
+    app.stream_committee_run("Should I trim semis?", config.SONNET_DEMO_MODEL, updates)
+
+    events = []
+    while not updates.empty():
+        events.append(updates.get_nowait())
+    event_kinds = [event_kind for event_kind, _ in events]
+    run_record = events[-1][1]
+    # One update per graph node: three analysts, pm, size, critic, verdict, recommend.
+    assert event_kinds == ["update"] * 8 + ["done"]
+    assert events[-2][1] == {"recommended_persona": "aggressive"}
+    assert run_record["proposal"]["question"] == "Should I trim semis?"
+    assert run_record["proposal"]["model_name"] == config.SONNET_DEMO_MODEL
+    assert books.read_run_log() == [run_record]
+    assert books.latest_sonnet_run()["taken_at"] == run_record["taken_at"]
