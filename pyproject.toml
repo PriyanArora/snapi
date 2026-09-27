@@ -1,0 +1,56 @@
+[project]
+name = "snapi"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "langgraph>=1.2.12,<1.3",
+    "langchain-anthropic>=1.7.4",
+    "snaptrade-python-sdk==13.0.26",
+    "yfinance==1.7.0",
+    "stockstats==0.6.8",
+    "fredapi==0.5.2",
+    "streamlit>=1.64",
+    "plotly>=6.3,<7",
+    "pandas",
+    "numpy<2",
+    "pydantic",
+    "requests",
+    "python-dotenv",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py312"
+extend-exclude = ["external", "spec1", "spec2", "spec3"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "config",
+    "prices",
+    "feeds",
+    "signals",
+    "portfolio",
+    "brokerage",
+    "books",
+    "committee",
+    "execute",
+    "backtest",
+    "app",
+    "external",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+norecursedirs = [".*", "spec1", "spec2", "spec3", "external"]
