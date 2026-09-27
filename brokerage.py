@@ -2,8 +2,9 @@
 
 Every account read goes through a 60-second in-process cache, so one cycle
 costs one read per account, shared by the agents and the dashboard (T19,
-story 28, Risk #8). The one write is `place_order`, used only by
-`execute` on Balanced's Approve. Run `python brokerage.py` once for the
+story 28), and every request is noted against the account's 10-a-minute
+budget (Risk #8). The one write is `place_order`, used only by `execute`
+on Balanced's Approve. Run `python brokerage.py` once for the
 go/no-go check and to find the two account ids for `.env`.
 """
 
@@ -27,10 +28,24 @@ ALPACA_PAPER_ACCOUNT_ENV_VAR = "SNAPTRADE_ALPACA_PAPER_ACCOUNT_ID"
 SANDBOX_ACCOUNT_ENV_VAR = "SNAPTRADE_SANDBOX_ACCOUNT_ID"
 
 CACHE_SECONDS = 60  # T19: at least 60 s between reads of one account
-ORDER_SPACING_SECONDS = 1.0  # Balanced step 4: at most one order per second
 ALPACA_PAPER_SLUG = "ALPACA-PAPER"
 
-# R4: only these states mean an order is done. Anything else (queued,
+# Risk #8: treat SnapTrade's 10 requests/min per account as enforced.
+ACCOUNT_REQUESTS_PER_MINUTE = 10
+RATE_WINDOW_SECONDS = 60
+# After a batch the lock caption and the order status re-read the two order lists.
+POST_BATCH_READS = 2
+# An unlocked Approve costs 4 + n + 2 requests on the account: 4 fresh reads
+# (open orders, last-24h orders, positions, balance), the n orders, then the
+# 2 order reads. Each order waits 12 s, the first one too, so the first
+# minute holds 4 reads + 4 orders (12-48 s) + the 2 reads of a batch that ends
+# there = 10, and a later minute at most 5 orders + those 2 reads + 2 expired
+# book reads = 9. At 11 s a fifth order fits in the first minute (11).
+# Balanced step 4's one order a second is then well kept.
+ORDER_SPACING_SECONDS = 12
+OPEN_ORDERS_LOOKBACK_DAYS = 90  # the SDK's maximum `days` for account orders
+
+# R4: only these states mean a recent order is done. Anything else (queued,
 # accepted, partial, unknown) has not filled yet and keeps Balanced locked.
 FINISHED_ORDER_STATUSES = frozenset(
     {
@@ -45,6 +60,9 @@ FINISHED_ORDER_STATUSES = frozenset(
 )
 
 _cache: dict[tuple[Callable, str], tuple[float, object]] = {}
+# ponytail: never pruned (~14k floats per account a day at 10 a minute);
+# drop entries older than RATE_WINDOW_SECONDS if the app runs for weeks.
+_request_times: dict[str, list[float]] = {}
 
 
 @dataclass(frozen=True)
@@ -149,6 +167,40 @@ def clear_cache(account_id: str) -> None:
         del _cache[key]
 
 
+def clear_order_cache(account_id: str) -> None:
+    """Forget the account's cached order lists, so the lock and order status show a batch just sent."""
+    # Queued orders don't move positions or cash, so the book read stays cached.
+    for fetch in (_fetch_open_orders, _fetch_recent_orders):
+        _cache.pop((fetch, account_id), None)
+
+
+def _note_request(account_id: str) -> None:
+    """Record one SnapTrade request against the account's per-minute budget (Risk #8)."""
+    _request_times.setdefault(account_id, []).append(time.monotonic())
+
+
+def seconds_until_order_room(account_id: str) -> float:
+    """Return how long the next order must wait so it, and the reads after the batch, stay within 10 a minute.
+
+    Page renders just before Approve can already have spent part of the
+    minute; ORDER_SPACING_SECONDS alone covers only Approve's own requests.
+    """
+    window_start = time.monotonic() - RATE_WINDOW_SECONDS
+    window_times = []
+    for sent_at in _request_times.get(account_id, []):
+        if sent_at > window_start:
+            window_times.append(sent_at)
+    window_times.sort()  # two Streamlit runs can append out of order
+    excess_requests = (
+        len(window_times) + 1 + POST_BATCH_READS - ACCOUNT_REQUESTS_PER_MINUTE
+    )
+    if excess_requests <= 0:
+        return 0.0
+
+    # The oldest `excess_requests` requests must leave the window first.
+    return window_times[excess_requests - 1] - window_start
+
+
 def _to_float(value: str | float | None) -> float | None:
     """Convert SnapTrade's decimal strings to float, keeping None as None."""
     if value is None:
@@ -180,9 +232,11 @@ def _usd_cash(balances: list[dict]) -> float:
 def _fetch_account_snapshot(account_id: str) -> AccountSnapshot:
     """Read positions plus balance for one account (never `get_user_holdings`: 410 for new accounts)."""
     account_information = get_client().account_information
+    _note_request(account_id)
     positions = account_information.get_all_account_positions(
         account_id=account_id
     ).body["results"]
+    _note_request(account_id)
     balances = account_information.get_user_account_balance(account_id=account_id).body
 
     holdings = [_holding_from_position(position) for position in positions]
@@ -213,6 +267,7 @@ def _fetch_recent_orders(account_id: str) -> list[dict[str, str | float | None]]
     """Read the last 24 h of orders in every status."""
     # The SDK default is executed orders only, which would hide queued
     # weekend orders and silently switch off the R4 lock.
+    _note_request(account_id)
     response = get_client().account_information.get_user_account_recent_orders(
         account_id=account_id,
         only_executed=False,
@@ -225,8 +280,33 @@ def get_recent_orders(account_id: str) -> list[dict[str, str | float | None]]:
     return _cached_read(_fetch_recent_orders, account_id)
 
 
+def _fetch_open_orders(account_id: str) -> list[dict[str, str | float | None]]:
+    """Read every order SnapTrade still lists as open, over the longest window it allows."""
+    _note_request(account_id)
+    response = get_client().account_information.get_user_account_orders(
+        account_id=account_id,
+        state="open",
+        days=OPEN_ORDERS_LOOKBACK_DAYS,
+    )
+    return [_order_row(order) for order in response.body]
+
+
+def get_open_orders(account_id: str) -> list[dict[str, str | float | None]]:
+    """Return the account's open orders from the last 90 days, cached (R4)."""
+    return _cached_read(_fetch_open_orders, account_id)
+
+
 def has_unfilled_orders(account_id: str) -> bool:
-    """Return True while any recent order has not reached a finished status (Balanced step 7, R4)."""
+    """Return True while any order is still open, which keeps Balanced locked (Balanced step 7, R4).
+
+    Any order SnapTrade lists as open locks, as does any last-24h order
+    that isn't in a finished status, unknown statuses included.
+    """
+    if get_open_orders(account_id):
+        return True
+
+    # Without real-time data SnapTrade refreshes the 90-day list once a day,
+    # so an order sent minutes ago may be missing; the 24 h read is realtime.
     for order in get_recent_orders(account_id):
         if order["status"] not in FINISHED_ORDER_STATUSES:
             return True
@@ -252,6 +332,7 @@ def _activity_row(activity: dict) -> dict[str, str | float | None]:
 
 def _fetch_activities(account_id: str) -> list[dict[str, str | float | None]]:
     """Read every activity type in one call: dividends, splits, mergers, transfers, trades."""
+    _note_request(account_id)
     response = get_client().account_information.get_account_activities(
         account_id=account_id
     )
@@ -266,10 +347,11 @@ def get_activities(account_id: str) -> list[dict[str, str | float | None]]:
 def place_order(account_id: str, order: Order) -> dict[str, str | int | None]:
     """Send one Market/Day whole-share order and return its acknowledgement row (Balanced steps 4-5).
 
-    The caller spaces orders ORDER_SPACING_SECONDS apart and clears this
-    account's cache once the batch is out.
+    The caller waits ORDER_SPACING_SECONDS and `seconds_until_order_room`
+    before each order and clears the order cache once the batch is out.
     """
     client_order_id = str(uuid.uuid4())
+    _note_request(account_id)
     response = get_client().trading.place_force_order(
         account_id=account_id,
         action=order.side.upper(),

@@ -4,16 +4,19 @@
 persona's book, re-derives whole-share orders from the approved target
 weights through the same `build_orders_for_targets` the preview used, and
 routes by account: Balanced to Alpaca Paper through SnapTrade (queued until
-the next open, locked while any order is still open, R4), Conservative and
-Aggressive to their SimBroker at the snapshot mark. A rerun on the same
-targets finds the book already there and places nothing (seam 2).
+the next open, locked while any order is still open, R4, and paced under
+SnapTrade's 10 requests a minute, Risk #8), Conservative and Aggressive to
+their SimBroker at the snapshot mark. A rerun on the same targets finds the
+book already there and places nothing (seam 2).
 
 The seed lives here, not in books.py, because it calls `execute`.
 """
 
 from __future__ import annotations
 
+import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, date, datetime
 
 import books
@@ -27,6 +30,14 @@ from external.models import Signal
 from portfolio import MODEL_WEIGHTS, Book, build_orders_for_targets, size_persona
 
 GROSS_WEIGHT_TOLERANCE = 1e-9  # float round-off in the sizing chain's sums
+
+# Called with (order_number, order_count) before each Balanced order waits its turn.
+ProgressCallback = Callable[[int, int], None]
+
+# One Balanced batch at a time. A batch takes minutes, Streamlit starts a new
+# run on any click meanwhile, and a second Approve's lock check would pass
+# until the first order is out (R4, Risk #17).
+_alpaca_batch_lock = threading.Lock()
 
 
 class ExecutionLockedError(Exception):
@@ -72,24 +83,57 @@ def _log_approval(
     books.append_run_log(approval)
 
 
+def _report_progress(
+    report_progress: ProgressCallback | None,
+    order_number: int,
+    order_count: int,
+) -> BaseException | None:
+    """Call the progress callback and return what it raised instead of raising it.
+
+    Streamlit stops a page on any click by raising inside its next call. A
+    half-placed batch stays locked until it fills (R4), so the caller keeps
+    placing and raises this once every order is out.
+    """
+    if report_progress is None:
+        return None
+
+    try:
+        report_progress(order_number, order_count)
+    except BaseException as progress_error:
+        return progress_error
+
+    return None
+
+
 def _place_on_alpaca_paper(
     account_id: str,
     persona_key: str,
     orders: list[Order],
     tag: FillTag,
+    report_progress: ProgressCallback | None,
 ) -> None:
-    """Place each order at most once per second and log every ack, even when the batch fails midway."""
+    """Place each order once SnapTrade's rate budget allows and log every ack, even when the batch fails midway."""
     acks = []
+    progress_error = None
     try:
-        for index, order in enumerate(orders):
-            if index > 0:
-                time.sleep(brokerage.ORDER_SPACING_SECONDS)
+        for order_number, order in enumerate(orders, start=1):
+            if progress_error is None:
+                progress_error = _report_progress(
+                    report_progress, order_number, len(orders)
+                )
+
+            # The first order waits too: the reads just made share its minute (Risk #8).
+            time.sleep(brokerage.ORDER_SPACING_SECONDS)
+            time.sleep(brokerage.seconds_until_order_room(account_id))
             acks.append(brokerage.place_order(account_id, order))
     finally:
-        # The run log and the next lock check must see every order that
-        # did go out (Balanced steps 5 and 7).
-        brokerage.clear_cache(account_id)
+        # The run log, the lock and the order status must see every order
+        # that did go out (Balanced steps 5-7).
+        brokerage.clear_order_cache(account_id)
         _log_approval(persona_key, tag, orders, acks, fills=[])
+
+    if progress_error is not None:
+        raise progress_error
 
 
 def _execute_on_alpaca_paper(
@@ -97,27 +141,39 @@ def _execute_on_alpaca_paper(
     target_weights: dict[str, float],
     marks: dict[str, float],
     tag: FillTag,
+    report_progress: ProgressCallback | None,
 ) -> list[Fill]:
     """Send Balanced's orders through SnapTrade; nothing fills before the next open, so no fills return."""
-    account_id = brokerage.alpaca_paper_account_id()
-
-    # Execution re-reads the book: a read cached from the preview could
-    # miss an order or a fill.
-    brokerage.clear_cache(account_id)
-
-    # Queued orders aren't positions yet, so a book read alone would
-    # double-order against them (R4, Risk #17).
-    if brokerage.has_unfilled_orders(account_id):
+    if not _alpaca_batch_lock.acquire(blocking=False):
         raise ExecutionLockedError(
-            "Balanced has orders waiting for the next open; "
-            "Approve unlocks once they fill."
+            "Balanced's orders from an earlier Approve are still going out; "
+            "wait for that batch to finish."
         )
 
-    orders = _orders_for_book(
-        books.alpaca_paper_book(), persona_key, target_weights, marks
-    )
-    if orders:
-        _place_on_alpaca_paper(account_id, persona_key, orders, tag)
+    try:
+        account_id = brokerage.alpaca_paper_account_id()
+
+        # Execution re-reads the book: a read cached from the preview could
+        # miss an order or a fill.
+        brokerage.clear_cache(account_id)
+
+        # Queued orders aren't positions yet, so a book read alone would
+        # double-order against them (R4, Risk #17).
+        if brokerage.has_unfilled_orders(account_id):
+            raise ExecutionLockedError(
+                "Balanced has orders waiting for the next open; "
+                "Approve unlocks once they fill."
+            )
+
+        orders = _orders_for_book(
+            books.alpaca_paper_book(), persona_key, target_weights, marks
+        )
+        if orders:
+            _place_on_alpaca_paper(
+                account_id, persona_key, orders, tag, report_progress
+            )
+    finally:
+        _alpaca_batch_lock.release()
 
     return []
 
@@ -149,12 +205,15 @@ def execute(
     proposal: Proposal,
     persona_key: str,
     tag: FillTag = "committee",
+    report_progress: ProgressCallback | None = None,
 ) -> list[Fill]:
     """Execute one persona's approved targets against a fresh read of its book and return the fills.
 
     Balanced returns no fills (its orders queue at Alpaca Paper) and raises
     ExecutionLockedError while earlier orders are still open. `tag` marks
     where the batch came from: Approve, the Rebalance button or the seed.
+    `report_progress` hears about each spaced-out Balanced order; simulator
+    fills are instant.
     """
     persona = PERSONAS[persona_key]
     target_weights = proposal.target_weights[persona_key]
@@ -171,7 +230,9 @@ def execute(
         )
 
     if persona.account == "alpaca_paper":
-        return _execute_on_alpaca_paper(persona_key, target_weights, marks, tag)
+        return _execute_on_alpaca_paper(
+            persona_key, target_weights, marks, tag, report_progress
+        )
 
     return _execute_on_simulator(persona_key, target_weights, marks, tag)
 

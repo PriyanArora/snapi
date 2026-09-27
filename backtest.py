@@ -2,12 +2,14 @@
 
 Our own pandas loop, not hedge_fund's backtest_fund, with no LLM or news
 calls (F16, Out of Scope). Each Monday (or the week's first open day, F19)
-it scores the 10 names with the same compute_technical_score the live
-Technical analyst uses (story 4), holds the names with a positive score at
-equal weight from that close to the next rebalance close, and pays 5 bps x
-turnover. The macro overlay then scales each week's return by the invested
-fraction (F13) of the regime that was knowable before the week, with the
-rest in cash at 0% (R11: point-in-time FRED and ALFRED inputs).
+it scores the 10 names at the previous trading day's close with the same
+compute_technical_score the live Technical analyst uses (story 4), holds
+the names with a positive score at equal weight, each capped at Balanced's
+12% per-name max (F10) with the rest in cash, from that Monday's close to
+the next rebalance close, and pays 5 bps x turnover. The macro overlay then
+scales each week's return by the invested fraction (F13) of the regime that
+was knowable before the week, with the rest in cash at 0% (R11:
+point-in-time FRED and ALFRED inputs).
 
 `uv run python backtest.py` needs FRED_API_KEY and writes the committed
 results file the Backtest tab reads. The file holds growth curves and
@@ -34,6 +36,7 @@ from signals import compute_macro_checklist, compute_technical_score
 
 BACKTEST_WEEKS = 52
 WEEKS_PER_YEAR = 52
+MAX_NAME_WEIGHT = config.PERSONAS["balanced"].max_position_pct  # F10: 12%
 
 # R11: these daily series are shifted one day; SAHMREALTIME uses ALFRED vintages instead.
 DAILY_SERIES_IDS = ("T10Y3M", "BAMLH0A0HYM2", "VIXCLS")
@@ -160,17 +163,21 @@ def macro_exposure(
     return config.REGIME_FRACTIONS[checklist.regime]
 
 
-def technical_weights(as_of: date) -> dict[str, float]:
-    """Return equal weights across the universe names with a positive technical score on `as_of`."""
+def technical_weights(signal_day: date) -> dict[str, float]:
+    """Return equal weights, each capped at 12% (F10), across the names scoring above 0 at `signal_day`'s close.
+
+    Weight the cap leaves over, and a week with no positive name, is cash.
+    """
     picks = []
     for ticker in config.UNIVERSE:
-        if compute_technical_score(ticker, as_of).score > 0:
+        if compute_technical_score(ticker, signal_day).score > 0:
             picks.append(ticker)
 
     if not picks:
         return {}  # no positive score: all cash this week
 
-    return {ticker: 1 / len(picks) for ticker in picks}
+    weight = min(1 / len(picks), MAX_NAME_WEIGHT)
+    return {ticker: weight for ticker in picks}
 
 
 def weekly_price_returns(
@@ -302,7 +309,10 @@ def run_backtest() -> dict:
     held_weights: dict[str, float] = {}
     for week_start, week_end in pairwise(rebalance_dates):
         period_returns = weekly_price_returns(closes, week_start, week_end)
-        target_weights = technical_weights(week_start)
+        # Signals from the close before the rebalance day; the trade happens
+        # at the rebalance day's close, so no signal uses its own bar.
+        signal_day = trading_days[trading_days.index(week_start) - 1]
+        target_weights = technical_weights(signal_day)
         cost = config.COST_BPS / 10_000 * turnover(target_weights, held_weights)
         technical_return = portfolio_return(target_weights, period_returns) - cost
         exposure = macro_exposure(week_start, daily_series, sahm_releases)
