@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 APP_PASSWORD_SECRET = "APP_PASSWORD"
 ANTHROPIC_KEY_ENV_VAR = "ANTHROPIC_API_KEY"
+# The macro regime behind seeding, Run swarm, Rebalance and Reset books.
+FRED_KEY_ENV_VAR = "FRED_API_KEY"
 SNAPTRADE_SETUP_NOTE = (
     "SnapTrade isn't configured. Set SNAPTRADE_CONSUMER_KEY, SNAPTRADE_CLIENT_ID "
     "and SNAPTRADE_ALPACA_PAPER_ACCOUNT_ID in .env."
@@ -118,9 +120,9 @@ def display_name(persona_key: str) -> str:
     return config.PERSONAS[persona_key].display_name
 
 
-def has_anthropic_key() -> bool:
-    """Return True when ANTHROPIC_API_KEY is set; Run swarm needs it."""
-    return bool(os.environ.get(ANTHROPIC_KEY_ENV_VAR))
+def missing_keys(*env_var_names: str) -> list[str]:
+    """Return the named env vars that are unset or empty, for the plain "needs <KEY>" notes."""
+    return [name for name in env_var_names if not os.environ.get(name)]
 
 
 def show_live_error(action: str, error: Exception) -> None:
@@ -203,14 +205,28 @@ def find_trade_blocker(persona_key: str) -> str | None:
     return None
 
 
-def prepare_live_books() -> None:
-    """Seed the simulator personas' opening books once (S16) and check SnapTrade can trade (Balanced step 2)."""
+def seed_opening_books() -> None:
+    """Seed Conservative and Aggressive once, while their fill logs are empty (S16); the seed's regime read needs FRED."""
+    import books
     import execute
+
+    is_seeded = all(books.has_fills(persona_key) for persona_key in books.SEED_PERSONAS)
+    if is_seeded:
+        return
+
+    if missing_keys(FRED_KEY_ENV_VAR):
+        st.info(f"Seeding the opening books needs {FRED_KEY_ENV_VAR} in .env.")
+        return
 
     try:
         execute.seed_books()
     except Exception as error:
         show_live_error("Seeding the opening books", error)
+
+
+def prepare_live_books() -> None:
+    """Seed the simulator personas' opening books once (S16) and check SnapTrade can trade (Balanced step 2)."""
+    seed_opening_books()
 
     for persona_key, persona in config.PERSONAS.items():
         try:
@@ -496,13 +512,14 @@ def approve_controls(run_record: dict) -> None:
 
 def committee_tab() -> None:
     """Run swarm fills five agent cards live; then the PM memo, three order tables and the critic beside Approve."""
+    missing_run_keys = missing_keys(ANTHROPIC_KEY_ENV_VAR, FRED_KEY_ENV_VAR)
     run_clicked = st.button(
         "Run swarm",
         type="primary",
-        disabled=not has_anthropic_key(),
+        disabled=bool(missing_run_keys),
     )
-    if not has_anthropic_key():
-        st.caption(f"Run swarm needs {ANTHROPIC_KEY_ENV_VAR} in .env.")
+    if missing_run_keys:
+        st.caption(f"Run swarm needs {' and '.join(missing_run_keys)} in .env.")
 
     # Lay out every slot first, so cards fill in place while the graph streams.
     card_slots = {}
@@ -711,9 +728,18 @@ def rebalance_controls(persona_key: str, book: Book, marks: dict[str, float]) ->
     preview_key = f"rebalance_preview_{persona_key}"
     outcome_key = f"rebalance_outcome_{persona_key}"
 
+    is_fred_missing = bool(missing_keys(FRED_KEY_ENV_VAR))
+    if is_fred_missing:
+        st.caption(f"Rebalance needs {FRED_KEY_ENV_VAR} in .env.")
+
     # Kept in session_state: a button under another button's `if` never
     # fires, because the outer button is False again on that rerun.
-    if st.button("Rebalance", key=f"rebalance_{persona_key}"):
+    rebalance_clicked = st.button(
+        "Rebalance",
+        key=f"rebalance_{persona_key}",
+        disabled=is_fred_missing,
+    )
+    if rebalance_clicked:
         st.session_state.pop(preview_key, None)
         st.session_state.pop(outcome_key, None)
         try:
@@ -779,11 +805,20 @@ def reset_books_control() -> None:
     if st.session_state.pop("books_reset", False):
         st.success("Simulator books cleared and re-seeded.")
 
+    is_fred_missing = bool(missing_keys(FRED_KEY_ENV_VAR))
+    if is_fred_missing:
+        st.caption(f"Reset books needs {FRED_KEY_ENV_VAR} in .env to re-seed.")
+
     confirmed = st.checkbox(
         "Clear the simulator fill logs and re-seed the opening books",
         key="confirm_reset",
     )
-    if not st.button("Reset books", disabled=not confirmed, key="reset_books"):
+    reset_clicked = st.button(
+        "Reset books",
+        disabled=is_fred_missing or not confirmed,
+        key="reset_books",
+    )
+    if not reset_clicked:
         return
 
     clear_rebalance_state()
@@ -1003,12 +1038,11 @@ def activity_tab() -> None:
 
 def is_chat_configured() -> bool:
     """Return True when the Anthropic key, the MCP URL and the hand-minted OAuth token are all set (R6)."""
-    required_env_vars = (
+    return not missing_keys(
         ANTHROPIC_KEY_ENV_VAR,
         SNAPTRADE_MCP_URL_ENV_VAR,
         SNAPTRADE_MCP_TOKEN_ENV_VAR,
     )
-    return all(os.environ.get(name) for name in required_env_vars)
 
 
 def portfolio_chat_model() -> Runnable:
