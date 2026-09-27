@@ -2,34 +2,29 @@
 
 from __future__ import annotations
 
+import importlib
+
 import numpy
+
+EXTERNAL_MODULES = (
+    "models",
+    "broker_models",
+    "sim",
+    "execution",
+    "limits",
+    "construction",
+    "cache",
+)
 
 
 def test_external_modules_import() -> None:
     """All 7 reused ai-hedge-fund modules in external/ import without error."""
-    from external import (
-        broker_models,
-        cache,
-        construction,
-        execution,
-        limits,
-        models,
-        sim,
-    )
-
-    assert (
-        broker_models
-        and cache
-        and construction
-        and execution
-        and limits
-        and models
-        and sim
-    )
+    for module_name in EXTERNAL_MODULES:
+        importlib.import_module(f"external.{module_name}")
 
 
 def test_stockstats_imports_on_numpy_one() -> None:
-    """stockstats imports cleanly and numpy is pinned to major version 1 (PRD: numpy 1.26)."""
+    """stockstats imports cleanly on numpy 1.x (the PRD pins numpy 1.26)."""
     import stockstats
 
     assert stockstats
