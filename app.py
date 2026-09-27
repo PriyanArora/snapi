@@ -560,23 +560,12 @@ def committee_tab() -> None:
             render_execution(persona_key, approval)
 
 
-def book_equity(book: dict, marks: dict[str, float]) -> float:
-    """Return a JSON-shaped book's value: cash plus every position at its mark."""
-    positions_value = 0.0
-    for ticker, shares in book["shares"].items():
-        positions_value += shares * marks[ticker]
-
-    return book["cash"] + positions_value
-
-
-def holdings_rows(book: dict, marks: dict[str, float]) -> list[dict]:
+def holdings_rows(book: Book, marks: dict[str, float], equity: float) -> list[dict]:
     """Return one table row per held ticker: sector, shares, mark, value, weight and average cost."""
-    equity = book_equity(book, marks)
-
     rows = []
-    for ticker, shares in sorted(book["shares"].items()):
+    for ticker, shares in sorted(book.shares.items()):
         value = shares * marks[ticker]
-        avg_cost = book["avg_cost"].get(ticker)
+        avg_cost = book.avg_cost.get(ticker)
         rows.append(
             {
                 "Ticker": ticker,
@@ -620,23 +609,26 @@ def sector_chart(
 
 def render_book(
     persona_key: str,
-    book: dict,
+    book: Book,
     marks: dict[str, float],
     sector_weights: dict[str, float],
 ) -> None:
     """Show one persona's limits, NAV, cash, holdings and sector weights against its own cap (S10, story 38)."""
+    import portfolio
+
     persona = config.PERSONAS[persona_key]
+    equity = portfolio.compute_book_equity(book, marks)
     st.caption(
         f"Sector cap {persona.sector_cap:.0%}, max per name "
         f"{persona.max_position_pct:.0%}, cash buffer {persona.cash_buffer:.0%}"
     )
     nav_column, cash_column = st.columns(2)
-    nav_column.metric("NAV", f"${book_equity(book, marks):,.0f}")
-    cash_column.metric("Cash", f"${book['cash']:,.0f}")
+    nav_column.metric("NAV", f"${equity:,.0f}")
+    cash_column.metric("Cash", f"${book.cash:,.0f}")
 
     holdings_column, chart_column = st.columns(2)
     with holdings_column:
-        holdings = holdings_rows(book, marks)
+        holdings = holdings_rows(book, marks, equity)
         if holdings:
             st.dataframe(holdings, hide_index=True)
         else:
@@ -848,7 +840,7 @@ def portfolio_tab() -> None:
             continue
 
         weights_by_sector = portfolio.sector_weights(book, marks)
-        render_book(persona_key, dataclasses.asdict(book), marks, weights_by_sector)
+        render_book(persona_key, book, marks, weights_by_sector)
         rebalance_controls(persona_key, book, marks)
 
     sandbox_panel()
