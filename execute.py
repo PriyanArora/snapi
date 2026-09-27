@@ -26,6 +26,8 @@ from external.broker_models import Fill, Order
 from external.models import Signal
 from portfolio import MODEL_WEIGHTS, Book, build_orders_for_targets, size_persona
 
+GROSS_WEIGHT_TOLERANCE = 1e-9  # float round-off in the sizing chain's sums
+
 
 class ExecutionLockedError(Exception):
     """Raised when Balanced still has orders open at the broker (R4)."""
@@ -51,13 +53,52 @@ def _orders_for_book(
     )
 
 
+def _log_approval(
+    persona_key: str,
+    tag: FillTag,
+    orders: list[Order],
+    acks: list[dict],
+    fills: list[Fill],
+) -> None:
+    """Append one executed batch to the run log (Balanced step 5: the acks are its record)."""
+    approval = ApprovalRecord(
+        approved_at=datetime.now(UTC),
+        persona=persona_key,
+        tag=tag,
+        orders=orders,
+        acks=acks,
+        fills=fills,
+    )
+    books.append_run_log(approval)
+
+
+def _place_on_alpaca_paper(
+    account_id: str,
+    persona_key: str,
+    orders: list[Order],
+    tag: FillTag,
+) -> None:
+    """Place each order at most once per second and log every ack, even when the batch fails midway."""
+    acks = []
+    try:
+        for index, order in enumerate(orders):
+            if index > 0:
+                time.sleep(brokerage.ORDER_SPACING_SECONDS)
+            acks.append(brokerage.place_order(account_id, order))
+    finally:
+        # The run log and the next lock check must see every order that
+        # did go out (Balanced steps 5 and 7).
+        brokerage.clear_cache(account_id)
+        _log_approval(persona_key, tag, orders, acks, fills=[])
+
+
 def _execute_on_alpaca_paper(
     persona_key: str,
     target_weights: dict[str, float],
     marks: dict[str, float],
     tag: FillTag,
 ) -> list[Fill]:
-    """Send Balanced's orders through SnapTrade and log the acks; nothing fills before the next open."""
+    """Send Balanced's orders through SnapTrade; nothing fills before the next open, so no fills return."""
     account_id = brokerage.alpaca_paper_account_id()
 
     # Execution re-reads the book: a read cached from the preview could
@@ -75,28 +116,8 @@ def _execute_on_alpaca_paper(
     orders = _orders_for_book(
         books.alpaca_paper_book(), persona_key, target_weights, marks
     )
-    if not orders:
-        return []
-
-    acks = []
-    try:
-        for index, order in enumerate(orders):
-            if index > 0:
-                time.sleep(brokerage.ORDER_SPACING_SECONDS)
-            acks.append(brokerage.place_order(account_id, order))
-    finally:
-        # Even after a mid-batch failure, the run log and the next lock
-        # check must see every order that did go out (Balanced steps 5, 7).
-        brokerage.clear_cache(account_id)
-        approval = ApprovalRecord(
-            approved_at=datetime.now(UTC),
-            persona=persona_key,
-            tag=tag,
-            orders=orders,
-            acks=acks,
-            fills=[],
-        )
-        books.append_run_log(approval)
+    if orders:
+        _place_on_alpaca_paper(account_id, persona_key, orders, tag)
 
     return []
 
@@ -120,15 +141,7 @@ def _execute_on_simulator(
         fills.append(broker.place_order(order))
 
     books.append_fills(persona_key, fills, tag)
-    approval = ApprovalRecord(
-        approved_at=datetime.now(UTC),
-        persona=persona_key,
-        tag=tag,
-        orders=orders,
-        acks=[],
-        fills=fills,
-    )
-    books.append_run_log(approval)
+    _log_approval(persona_key, tag, orders, acks=[], fills=fills)
     return fills
 
 
@@ -146,6 +159,16 @@ def execute(
     persona = PERSONAS[persona_key]
     target_weights = proposal.target_weights[persona_key]
     marks = prices.latest_marks()
+
+    # The proposal is read back from the run log on disk. Targets above the
+    # persona's max invested % could only come from a corrupt or hand-edited
+    # line, and would spend cash the book doesn't have.
+    gross_weight = sum(target_weights.values())
+    if gross_weight > persona.max_invested_pct + GROSS_WEIGHT_TOLERANCE:
+        raise ValueError(
+            f"{persona_key} targets sum to {gross_weight:.4f}, above its "
+            f"max invested {persona.max_invested_pct:.4f}; refusing to trade"
+        )
 
     if persona.account == "alpaca_paper":
         return _execute_on_alpaca_paper(persona_key, target_weights, marks, tag)
