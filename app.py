@@ -53,7 +53,10 @@ ACTIVITY_SETUP_NOTE = (
     "to show the Sandbox's activity and Alpaca Paper's order history."
 )
 NO_REPLAY_NOTE = "No replay saved yet."
-LIVE_DEMO_NOTE = "Live demo on laptop: this public app is a replay."
+LIVE_DEMO_NOTE = (
+    "Live demo on laptop: this public app replays the committed rehearsal, "
+    "so its buttons are off."
+)
 CHAT_SETUP_NOTE = (
     "The chat isn't configured. Set SNAPTRADE_MCP_URL and "
     "SNAPTRADE_MCP_OAUTH_TOKEN (minted by hand, R6) in .env."
@@ -502,6 +505,16 @@ def caption_queued_lock() -> None:
 
 def approve_controls(run_record: dict) -> None:
     """Approve executes the proposal on screen for all three personas; nothing trades before it (story 22, T18)."""
+    if is_cloud_mode():
+        st.button(
+            "Approve",
+            type="primary",
+            key="approve",
+            disabled=True,
+            help=LIVE_DEMO_NOTE,
+        )
+        return
+
     caption_queued_lock()
     if not st.button("Approve", type="primary", key="approve"):
         return
@@ -517,14 +530,50 @@ def approve_controls(run_record: dict) -> None:
     clear_rebalance_state()
 
 
+def find_replay_run(records: list[dict]) -> tuple[dict | None, list[dict]]:
+    """Return the last run that was approved with its Approve batches, else the last run and no batches.
+
+    A run's Approve batches follow it in the log until the next run. The
+    rehearsal runs once more after Approve, and that last run has none.
+    """
+    runs_with_approvals = []
+    for record in records:
+        if record["kind"] == "run":
+            runs_with_approvals.append((record, []))
+        elif runs_with_approvals and record["tag"] == "committee":
+            runs_with_approvals[-1][1].append(record)
+
+    if not runs_with_approvals:
+        return None, []
+
+    for run, approvals in reversed(runs_with_approvals):
+        if approvals:
+            return run, approvals
+
+    last_run, _ = runs_with_approvals[-1]
+    return last_run, []
+
+
+def load_committee_replay() -> None:
+    """Put the committed run and what its Approve did where a live run would be, for the same renderers (R7)."""
+    run_record, approvals = find_replay_run(read_jsonl(config.RUN_LOG_PATH))
+    st.session_state["run_record"] = run_record
+    st.session_state["approval"] = None
+    if approvals:
+        # Skip and lock notes aren't logged; the batches are.
+        st.session_state["approval"] = {"notes": {}, "records": approvals}
+
+
 def committee_tab() -> None:
     """Run swarm fills five agent cards live; then the PM memo, three order tables and the critic beside Approve."""
-    run_clicked = st.button("Run swarm", type="primary", disabled=is_cloud_mode())
+    run_clicked = st.button(
+        "Run swarm",
+        type="primary",
+        disabled=is_cloud_mode(),
+        help=LIVE_DEMO_NOTE if is_cloud_mode() else None,
+    )
     if is_cloud_mode():
-        st.caption(
-            f"Run swarm needs {ANTHROPIC_KEY_ENV_VAR} in .env; "
-            "the live committee runs on the laptop."
-        )
+        load_committee_replay()
 
     # Lay out every slot first, so cards fill in place while the graph streams.
     card_slots = {}
@@ -539,9 +588,16 @@ def committee_tab() -> None:
         run_swarm(card_slots)
 
     run_record = st.session_state.get("run_record")
+    if run_record is None and is_cloud_mode():
+        st.info(NO_REPLAY_NOTE)
+        return
+
     if run_record is None:
         st.info("Press Run swarm to convene the committee.")
         return
+
+    if is_cloud_mode():
+        st.caption(f"Replay of the committee run at {run_record['taken_at']}.")
 
     proposal = run_record["proposal"]
     for card, slot in card_slots.items():
@@ -776,10 +832,20 @@ def render_sandbox(rows: list[dict]) -> None:
 
 
 def sandbox_panel() -> None:
-    """Read the Sandbox holdings through the shared 60 s SnapTrade cache and show them, or say why not."""
+    """Show the Sandbox holdings: live through the shared 60 s SnapTrade cache, on Cloud from the activity replay."""
+    st.subheader("SnapTrade Sandbox (demo data)")
+    if is_cloud_mode():
+        activity = read_json(ACTIVITY_SNAPSHOT_PATH)
+        if activity is None:
+            st.caption(NO_REPLAY_NOTE)
+            return
+
+        # Saved with the activity: the PRD reads both from one snapshot (S16).
+        render_sandbox(activity["sandbox_holdings"])
+        return
+
     import brokerage
 
-    st.subheader("SnapTrade Sandbox (demo data)")
     if not brokerage.is_sandbox_configured():
         st.caption(SANDBOX_SETUP_NOTE)
         return
@@ -795,9 +861,13 @@ def sandbox_panel() -> None:
 
 def reset_books_control() -> None:
     """Clear the simulator fill logs and re-seed the opening books, for a clean rehearsal (S16, story 58)."""
+    st.subheader("Reset books")
+    if is_cloud_mode():
+        st.button("Reset books", disabled=True, help=LIVE_DEMO_NOTE, key="reset_books")
+        return
+
     import execute
 
-    st.subheader("Reset books")
     if st.session_state.pop("books_reset", False):
         st.success("Simulator books cleared and re-seeded.")
 
@@ -819,8 +889,34 @@ def reset_books_control() -> None:
     st.rerun()
 
 
-def portfolio_tab() -> None:
-    """Per-persona holdings and sector charts with Rebalance, then the Sandbox panel and Reset books."""
+def render_replay_books() -> None:
+    """Draw every persona's book from the last logged run; Cloud can't import the live modules (D10, S9)."""
+    run_records = read_jsonl(config.RUN_LOG_PATH)
+    runs = [record for record in run_records if record["kind"] == "run"]
+    if not runs:
+        st.info(NO_REPLAY_NOTE)
+        return
+
+    last_run = runs[-1]
+    st.caption(f"Books as of the last logged run, {last_run['taken_at']}.")
+    for persona_key, persona in config.PERSONAS.items():
+        st.subheader(persona.display_name)
+        render_book(
+            persona_key,
+            last_run["books"][persona_key],
+            last_run["marks"],
+            last_run["sector_weights"][persona_key],
+        )
+        st.button(
+            "Rebalance",
+            key=f"rebalance_{persona_key}",
+            disabled=True,
+            help=LIVE_DEMO_NOTE,
+        )
+
+
+def render_live_books() -> None:
+    """Draw every persona's current book with its Rebalance controls (S8, S10)."""
     import books
     import portfolio
     import prices
@@ -838,6 +934,14 @@ def portfolio_tab() -> None:
         render_book(persona_key, dataclasses.asdict(book), marks, weights_by_sector)
         rebalance_controls(persona_key, book, marks)
 
+
+def portfolio_tab() -> None:
+    """Per-persona holdings and sector charts with Rebalance, then the Sandbox panel and Reset books."""
+    if is_cloud_mode():
+        render_replay_books()
+    else:
+        render_live_books()
+
     sandbox_panel()
     reset_books_control()
 
@@ -851,6 +955,10 @@ def forward_test_tab() -> None:
     """Plot NAV per persona and SPY from the run log, normalized to the first logged run (S14, F23, stories 44-45)."""
     run_records = read_jsonl(config.RUN_LOG_PATH)
     runs = [record for record in run_records if record["kind"] == "run"]
+    if not runs and is_cloud_mode():
+        st.info(NO_REPLAY_NOTE)
+        return
+
     if not runs:
         st.info(
             "The forward test starts with the first Run swarm: "
@@ -1058,7 +1166,6 @@ def ask_portfolio_chat(history: list[dict], question: str) -> None:
 def chat_tab() -> None:
     """Answer plain-English portfolio questions through SnapTrade's hosted MCP (S13, stories 41-42)."""
     if is_cloud_mode():
-        st.caption(LIVE_DEMO_NOTE)
         transcript = read_json(CHAT_TRANSCRIPT_PATH)
         if transcript is None:
             st.info(NO_REPLAY_NOTE)
@@ -1086,7 +1193,11 @@ def main() -> None:
     st.set_page_config(page_title="snapi", layout="wide")
     load_dotenv()  # laptop keys from .env; the Cloud app has none
     check_password()
-    prepare_live_books()
+    if is_cloud_mode():
+        # No keys: every tab replays the committed files and nothing live runs (S9).
+        st.info(LIVE_DEMO_NOTE)
+    else:
+        prepare_live_books()
 
     tab_labels = ["Committee", "Portfolio", "Activity", "Chat", "Forward test"]
     committee_area, portfolio_area, activity_area, chat_area, forward_test_area = (
