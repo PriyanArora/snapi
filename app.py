@@ -853,8 +853,9 @@ def load_saved_run() -> dict | None:
 
 
 def end_live_run(error_message: str) -> None:
-    """Stop following a failed or stalled live run: its error shows, over the saved run when there is one."""
+    """Stop following a failed or stalled live run; the saved run stands in for it when there is one."""
     live_run = st.session_state.pop("live_run")
+    logger.error("Live run ended: %s", error_message)
     st.session_state["run_error"] = error_message
     if not live_run["is_past_fallback"]:
         st.session_state["saved_run"] = load_saved_run()
@@ -1203,20 +1204,15 @@ def render_prompt_bar(is_running: bool) -> tuple[str, str, bool]:
 
 
 def run_label(record: dict) -> str:
-    """Return a run's picker label, e.g. "September 27, 2026, 10:42 · Sonnet 5 · <question>"; a saved Sonnet run says so."""
+    """Return a run's picker label, e.g. "September 27, 2026, 10:42 · Sonnet 5 · <question>"."""
     proposal = record["proposal"]
-    label = " · ".join(
+    return " · ".join(
         [
             format_long_time(record["taken_at"]),
             config.get_model_label(proposal["model_name"]),
             textwrap.shorten(proposal["question"], 60, placeholder="…"),
         ]
     )
-    # Only a saved Sonnet run carries saved_at.
-    if "saved_at" in record:
-        return f"Saved Sonnet run · {label}"
-
-    return label
 
 
 def render_previous_runs(
@@ -1249,21 +1245,6 @@ def render_previous_runs(
     return records[picked_index]
 
 
-def render_saved_run_label(saved_run: dict, is_running: bool) -> None:
-    """Say plainly that the flow shows the saved Sonnet run, and whether the live run may still replace it."""
-    title = (
-        f"Saved Sonnet run from {format_long_time(saved_run['taken_at'])} · "
-        f"question: {saved_run['proposal']['question']}"
-    )
-    description = None
-    if is_running:
-        description = (
-            "The live run is still going; it replaces this one when it finishes."
-        )
-
-    ui.alert(title, description, key="saved_run_label")
-
-
 def committee_tab() -> None:
     """Ask the committee a question on a chosen model, watch the swarm fill its flow live, then approve one persona (S11)."""
     with ui.elements(key="committee_intro") as intro:
@@ -1283,10 +1264,11 @@ def committee_tab() -> None:
         follow_live_run()
 
     run_error = st.session_state.get("run_error")
-    if run_error is not None:
-        ui.alert("Run swarm failed", run_error, variant="destructive", key="run_error")
-
     saved_run = st.session_state.get("saved_run")
+    # The saved run stands in for a failed live run as if it were live; the
+    # error still goes to the terminal log.
+    if run_error is not None and saved_run is None:
+        ui.alert("Run swarm failed", run_error, variant="destructive", key="run_error")
     records = runs[::-1]
     if saved_run is not None:
         records.insert(0, saved_run)
@@ -1301,8 +1283,6 @@ def committee_tab() -> None:
             ui.alert("Press Run swarm to convene the committee.", key="committee_empty")
         render_flow({})
     else:
-        if picked_run is saved_run:
-            render_saved_run_label(saved_run, is_running=live_run is not None)
         render_flow(picked_run["proposal"])
         is_approvable = picked_run is saved_run or picked_run is runs[-1]
         render_approval_section(picked_run, is_approvable)
