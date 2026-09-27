@@ -6,8 +6,8 @@ weights through the same `build_orders_for_targets` the preview used, and
 routes by account: Balanced to Alpaca Paper through SnapTrade (queued until
 the next open, locked while any order is still open, R4, and paced under
 SnapTrade's 10 requests a minute, Risk #8), Conservative and Aggressive to
-their SimBroker at the snapshot mark. A rerun on the same
-targets finds the book already there and places nothing (seam 2).
+their SimBroker at the snapshot mark. A rerun on the same targets finds the
+book already there and places nothing (seam 2).
 
 The seed lives here, not in books.py, because it calls `execute`.
 """

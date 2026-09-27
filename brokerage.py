@@ -60,7 +60,8 @@ FINISHED_ORDER_STATUSES = frozenset(
 )
 
 _cache: dict[tuple[Callable, str], tuple[float, object]] = {}
-# ponytail: never pruned; at 10 requests a minute a day adds ~14k floats per account.
+# ponytail: never pruned (~14k floats per account a day at 10 a minute);
+# drop entries older than RATE_WINDOW_SECONDS if the app runs for weeks.
 _request_times: dict[str, list[float]] = {}
 
 
