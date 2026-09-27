@@ -188,6 +188,6 @@ DISCLAIMER = (
     "advice."
 )
 
-# Shared data files: books.py writes the run log, the app replays it (R7, R9).
+# Shared data files: books.py writes the run log, the app reads it (R9).
 DATA_DIR = Path(__file__).resolve().parent / "data"
 RUN_LOG_PATH = DATA_DIR / "run_log.jsonl"

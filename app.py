@@ -2,11 +2,10 @@
 
 Heavy modules (books, committee, execute, brokerage and everything they pull
 in: langgraph, langchain, snaptrade, external/) are imported inside the live
-functions that need them, not at the top. The PRD asks for lazy imports so
-the public replay never loads them (S9); that overrides the usual
-imports-at-the-top rule. Renderers take plain JSON-shaped dicts, so a run
-logged to `data/run_log.jsonl` and a run made in this session draw the same
-way.
+functions that need them, not at the top. The PRD asks for lazy imports to
+keep start-up fast; that overrides the usual imports-at-the-top rule.
+Renderers take plain JSON-shaped dicts, so a run logged to
+`data/run_log.jsonl` and a run made in this session draw the same way.
 """
 
 from __future__ import annotations
@@ -16,8 +15,10 @@ import hmac
 import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import plotly.graph_objects as go
 import streamlit as st
@@ -26,6 +27,7 @@ from dotenv import load_dotenv
 import config
 
 if TYPE_CHECKING:
+    from langchain_core.runnables import Runnable
     from streamlit.delta_generator import DeltaGenerator
 
     from committee import Proposal, Snapshot
@@ -43,6 +45,38 @@ SANDBOX_SETUP_NOTE = (
     "Not configured. Set SNAPTRADE_CONSUMER_KEY, SNAPTRADE_CLIENT_ID and "
     "SNAPTRADE_SANDBOX_ACCOUNT_ID in .env to show the Sandbox's demo holdings."
 )
+
+ACTIVITY_SETUP_NOTE = (
+    "The Activity tab needs SNAPTRADE_CONSUMER_KEY, SNAPTRADE_CLIENT_ID, "
+    "SNAPTRADE_SANDBOX_ACCOUNT_ID and SNAPTRADE_ALPACA_PAPER_ACCOUNT_ID in .env."
+)
+CHAT_SETUP_NOTE = (
+    "The chat needs ANTHROPIC_API_KEY, SNAPTRADE_MCP_URL and "
+    "SNAPTRADE_MCP_OAUTH_TOKEN (minted by hand, R6) in .env."
+)
+
+# SnapTrade's hosted MCP: 18 read-only tools, so the chat can't trade and
+# the SDK stays the only write path (S13, T21, story 42).
+SNAPTRADE_MCP_URL_ENV_VAR = "SNAPTRADE_MCP_URL"
+SNAPTRADE_MCP_TOKEN_ENV_VAR = "SNAPTRADE_MCP_OAUTH_TOKEN"
+SNAPTRADE_MCP_SERVER_NAME = "snaptrade"
+CHAT_MAX_TOKENS = 4000
+CHAT_SYSTEM_PROMPT = (
+    "You answer questions about the user's SnapTrade brokerage accounts, which "
+    "hold paper and demo money only. Read them with the SnapTrade tools. You "
+    "can't place or change trades. Keep answers short and plain."
+)
+CHAT_PLACEHOLDER = "Ask about your portfolio, e.g. What's my largest sector exposure?"
+
+# Cash dividends. REI (reinvestment) pairs with a DIVIDEND row, so counting
+# it too would double the income.
+DIVIDEND_TYPES = frozenset({"DIVIDEND", "SUBSTITUTE_DIVIDEND"})
+# Trades start hidden: Q11's table is dividends, splits, mergers and
+# transfers. The type filter can add them back.
+TRADE_TYPES = frozenset({"BUY", "SELL"})
+
+NEW_YORK = ZoneInfo("America/New_York")
+SATURDAY = 5  # datetime.weekday(): Monday is 0
 
 ANALYSTS = ("sentiment", "technical", "macro")
 CARD_TITLES = {
@@ -81,9 +115,9 @@ def display_name(persona_key: str) -> str:
     return config.PERSONAS[persona_key].display_name
 
 
-def is_cloud_mode() -> bool:
-    """Return True without an Anthropic key: the public replay, or a laptop before its keys exist (S9)."""
-    return not os.environ.get(ANTHROPIC_KEY_ENV_VAR)
+def has_anthropic_key() -> bool:
+    """Return True when ANTHROPIC_API_KEY is set; Run swarm needs it."""
+    return bool(os.environ.get(ANTHROPIC_KEY_ENV_VAR))
 
 
 def show_live_error(action: str, error: Exception) -> None:
@@ -360,6 +394,15 @@ def execute_personas(proposal: Proposal, persona_keys: list[str], tag: str) -> d
     return {"notes": notes, "records": new_records}
 
 
+def next_open_phrase(approved_at: str) -> str:
+    """Name the open that orders sent at `approved_at` wait for: Monday's on a weekend, else the next one."""
+    approved_in_new_york = datetime.fromisoformat(approved_at).astimezone(NEW_YORK)
+    if approved_in_new_york.weekday() >= SATURDAY:
+        return "Monday's 09:30 ET open"
+
+    return "the next market open"
+
+
 def render_approval_record(record: dict) -> None:
     """Show one executed batch: SnapTrade's acknowledgements for Balanced, simulator fills for the others.
 
@@ -368,8 +411,9 @@ def render_approval_record(record: dict) -> None:
     """
     if record["acks"]:
         st.success(
-            "Sent through SnapTrade to Alpaca Paper: queued for Monday's "
-            "09:30 ET open. Each order's acknowledgement is below."
+            "Sent through SnapTrade to Alpaca Paper: queued until "
+            f"{next_open_phrase(record['approved_at'])}. Each order's "
+            "acknowledgement is below."
         )
         ack_rows = []
         for ack in record["acks"]:
@@ -449,12 +493,13 @@ def approve_controls(run_record: dict) -> None:
 
 def committee_tab() -> None:
     """Run swarm fills five agent cards live; then the PM memo, three order tables and the critic beside Approve."""
-    run_clicked = st.button("Run swarm", type="primary", disabled=is_cloud_mode())
-    if is_cloud_mode():
-        st.caption(
-            f"Run swarm needs {ANTHROPIC_KEY_ENV_VAR} in .env; "
-            "the live committee runs on the laptop."
-        )
+    run_clicked = st.button(
+        "Run swarm",
+        type="primary",
+        disabled=not has_anthropic_key(),
+    )
+    if not has_anthropic_key():
+        st.caption(f"Run swarm needs {ANTHROPIC_KEY_ENV_VAR} in .env.")
 
     # Lay out every slot first, so cards fill in place while the graph streams.
     card_slots = {}
@@ -817,20 +862,179 @@ def forward_test_tab() -> None:
     st.plotly_chart(figure, key="forward_test")
 
 
+def dividend_income(activities: list[dict]) -> float:
+    """Return the cash dividends paid across the activity rows."""
+    income = 0.0
+    for activity in activities:
+        if activity["type"] in DIVIDEND_TYPES:
+            income += activity["amount"] or 0.0
+
+    return income
+
+
+def render_sandbox_activities(activities: list[dict]) -> None:
+    """Show dividend income and the Sandbox's activity rows, newest first, filtered by type (S12, Q11)."""
+    st.subheader("SnapTrade Sandbox activity (demo data)")
+    st.metric("Dividend income", f"${dividend_income(activities):,.2f}")
+
+    # SnapTrade's type is a best-effort string with no merger value, so
+    # the filter offers whatever types the data holds.
+    present_types = sorted({activity["type"] for activity in activities})
+    default_types = [name for name in present_types if name not in TRADE_TYPES]
+    chosen_types = st.multiselect(
+        "Types",
+        present_types,
+        default=default_types,
+        key="activity_types",
+    )
+
+    # SnapTrade already returns activities newest first.
+    shown = [activity for activity in activities if activity["type"] in chosen_types]
+    if not shown:
+        st.caption("No activity of the chosen types.")
+        return
+
+    st.dataframe(shown, hide_index=True)
+
+
+def render_alpaca_orders(orders: list[dict]) -> None:
+    """Show Balanced's Alpaca Paper orders from the last 24 h with their status, newest first."""
+    st.subheader("Alpaca Paper order history (last 24 h)")
+    st.caption(
+        "Alpaca Paper doesn't simulate dividends, so income shows for the Sandbox only."
+    )
+    if not orders:
+        st.caption("No orders in the last 24 hours.")
+        return
+
+    newest_first = sorted(
+        orders, key=lambda order: order["time_placed"] or "", reverse=True
+    )
+    st.dataframe(newest_first, hide_index=True)
+
+
+def activity_tab() -> None:
+    """Show SnapTrade Sandbox activity and Alpaca Paper order history, read-only (S12, story 40)."""
+    import brokerage
+
+    if not (
+        brokerage.is_sandbox_configured() and brokerage.is_alpaca_paper_configured()
+    ):
+        st.info(ACTIVITY_SETUP_NOTE)
+        return
+
+    # Both reads go through the 60 s cache. Recent orders is the same
+    # all-status read the R4 lock uses, so queued orders show their status (Q11).
+    try:
+        activities = brokerage.get_activities(brokerage.sandbox_account_id())
+        orders = brokerage.get_recent_orders(brokerage.alpaca_paper_account_id())
+    except Exception as error:
+        show_live_error("Reading SnapTrade activity", error)
+        return
+
+    render_sandbox_activities(activities)
+    render_alpaca_orders(orders)
+
+
+def is_chat_configured() -> bool:
+    """Return True when the Anthropic key, the MCP URL and the hand-minted OAuth token are all set (R6)."""
+    required_env_vars = (
+        ANTHROPIC_KEY_ENV_VAR,
+        SNAPTRADE_MCP_URL_ENV_VAR,
+        SNAPTRADE_MCP_TOKEN_ENV_VAR,
+    )
+    return all(os.environ.get(name) for name in required_env_vars)
+
+
+def portfolio_chat_model() -> Runnable:
+    """Return Claude wired to SnapTrade's hosted MCP with the hand-minted OAuth token (S13, R6).
+
+    langchain-anthropic adds the mcp-client beta header itself once
+    `mcp_servers` is set. The Claude API's MCP connector isn't ZDR-eligible,
+    which is fine for paper data.
+    """
+    from langchain_anthropic import ChatAnthropic
+
+    model = ChatAnthropic(
+        model=config.get_model_name(),
+        max_tokens=CHAT_MAX_TOKENS,
+        mcp_servers=[
+            {
+                "type": "url",
+                "url": os.environ[SNAPTRADE_MCP_URL_ENV_VAR],
+                "name": SNAPTRADE_MCP_SERVER_NAME,
+                "authorization_token": os.environ[SNAPTRADE_MCP_TOKEN_ENV_VAR],
+            }
+        ],
+    )
+    # The server entry only connects; the toolset entry offers its tools to Claude.
+    toolset = {"type": "mcp_toolset", "mcp_server_name": SNAPTRADE_MCP_SERVER_NAME}
+    return model.bind_tools([toolset])
+
+
+def render_chat_turns(turns: list[dict]) -> None:
+    """Show each question and answer as a chat bubble."""
+    for turn in turns:
+        with st.chat_message(turn["role"]):
+            st.markdown(escape_markdown_math(turn["content"]))
+
+
+def ask_portfolio_chat(history: list[dict], question: str) -> None:
+    """Answer one question with the whole conversation so far, then keep both turns in the history.
+
+    The MCP round trips run on Anthropic's side inside the one call; `.text`
+    keeps only the answer's text blocks.
+    """
+    question_turn = {"role": "user", "content": question}
+    messages = [("system", CHAT_SYSTEM_PROMPT)]
+    for turn in [*history, question_turn]:
+        messages.append((turn["role"], turn["content"]))
+
+    try:
+        with st.spinner("Reading your SnapTrade accounts..."):
+            reply = portfolio_chat_model().invoke(messages)
+    except Exception as error:
+        # An expired token lands here (Risk #15): mint a new one (R6).
+        show_live_error("The portfolio chat", error)
+        return
+
+    history.append(question_turn)
+    history.append({"role": "assistant", "content": str(reply.text)})
+    st.rerun()
+
+
+def chat_tab() -> None:
+    """Answer plain-English portfolio questions through SnapTrade's hosted MCP, live only (S13, stories 41-42)."""
+    if not is_chat_configured():
+        st.info(CHAT_SETUP_NOTE)
+        return
+
+    history = st.session_state.setdefault("chat_history", [])
+    render_chat_turns(history)
+    question = st.chat_input(CHAT_PLACEHOLDER)
+    if question:
+        ask_portfolio_chat(history, question)
+
+
 def main() -> None:
     """Render the gated app; tabs follow the Q12 demo narrative."""
     st.set_page_config(page_title="snapi", layout="wide")
-    load_dotenv()  # laptop keys from .env; the Cloud app has none
+    load_dotenv()  # keys from .env
     check_password()
     prepare_live_books()
 
-    committee_area, portfolio_area, forward_test_area = st.tabs(
-        ["Committee", "Portfolio", "Forward test"]
+    tab_labels = ["Committee", "Portfolio", "Activity", "Chat", "Forward test"]
+    committee_area, portfolio_area, activity_area, chat_area, forward_test_area = (
+        st.tabs(tab_labels)
     )
     with committee_area:
         committee_tab()
     with portfolio_area:
         portfolio_tab()
+    with activity_area:
+        activity_tab()
+    with chat_area:
+        chat_tab()
     with forward_test_area:
         forward_test_tab()
 
