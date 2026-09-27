@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 import config
 
 if TYPE_CHECKING:
+    from langchain_core.runnables import Runnable
     from streamlit.delta_generator import DeltaGenerator
 
     from committee import Proposal, Snapshot
@@ -52,9 +53,28 @@ ACTIVITY_SETUP_NOTE = (
     "to show the Sandbox's activity and Alpaca Paper's order history."
 )
 NO_REPLAY_NOTE = "No replay saved yet."
+LIVE_DEMO_NOTE = "Live demo on laptop: this public app is a replay."
+CHAT_SETUP_NOTE = (
+    "The chat isn't configured. Set SNAPTRADE_MCP_URL and "
+    "SNAPTRADE_MCP_OAUTH_TOKEN (minted by hand, R6) in .env."
+)
 
 # Replay files the laptop writes and the public app reads (R7).
 ACTIVITY_SNAPSHOT_PATH = config.DATA_DIR / "activity_snapshot.json"
+CHAT_TRANSCRIPT_PATH = config.DATA_DIR / "chat_transcript.json"
+
+# SnapTrade's hosted MCP: 18 read-only tools, so the chat can't trade and
+# the SDK stays the only write path (S13, T21, story 42).
+SNAPTRADE_MCP_URL_ENV_VAR = "SNAPTRADE_MCP_URL"
+SNAPTRADE_MCP_TOKEN_ENV_VAR = "SNAPTRADE_MCP_OAUTH_TOKEN"
+SNAPTRADE_MCP_SERVER_NAME = "snaptrade"
+CHAT_MAX_TOKENS = 4000
+CHAT_SYSTEM_PROMPT = (
+    "You answer questions about the user's SnapTrade brokerage accounts, which "
+    "hold paper and demo money only. Read them with the SnapTrade tools. You "
+    "can't place or change trades. Keep answers short and plain."
+)
+CHAT_PLACEHOLDER = "Ask about your portfolio, e.g. What's my largest sector exposure?"
 
 # Cash dividends. REI (reinvestment) pairs with a DIVIDEND row, so counting
 # it too would double the income.
@@ -972,6 +992,95 @@ def activity_tab() -> None:
     save_replay_button("Save activity replay", ACTIVITY_SNAPSHOT_PATH, activity)
 
 
+def is_chat_configured() -> bool:
+    """Return True when the MCP URL and the hand-minted OAuth token are both set (R6)."""
+    required_env_vars = (SNAPTRADE_MCP_URL_ENV_VAR, SNAPTRADE_MCP_TOKEN_ENV_VAR)
+    return all(os.environ.get(name) for name in required_env_vars)
+
+
+def portfolio_chat_model() -> Runnable:
+    """Return Claude wired to SnapTrade's hosted MCP with the hand-minted OAuth token (S13, R6).
+
+    langchain-anthropic adds the mcp-client beta header itself once
+    `mcp_servers` is set. The Claude API's MCP connector isn't ZDR-eligible,
+    which is fine for paper data.
+    """
+    from langchain_anthropic import ChatAnthropic
+
+    model = ChatAnthropic(
+        model=config.get_model_name(),
+        max_tokens=CHAT_MAX_TOKENS,
+        mcp_servers=[
+            {
+                "type": "url",
+                "url": os.environ[SNAPTRADE_MCP_URL_ENV_VAR],
+                "name": SNAPTRADE_MCP_SERVER_NAME,
+                "authorization_token": os.environ[SNAPTRADE_MCP_TOKEN_ENV_VAR],
+            }
+        ],
+    )
+    # The server entry only connects; the toolset entry offers its tools to Claude.
+    toolset = {"type": "mcp_toolset", "mcp_server_name": SNAPTRADE_MCP_SERVER_NAME}
+    return model.bind_tools([toolset])
+
+
+def render_chat_turns(turns: list[dict]) -> None:
+    """Show each question and answer as a chat bubble."""
+    for turn in turns:
+        with st.chat_message(turn["role"]):
+            st.markdown(escape_markdown_math(turn["content"]))
+
+
+def ask_portfolio_chat(history: list[dict], question: str) -> None:
+    """Answer one question with the whole conversation so far, then keep both turns in the history.
+
+    The MCP round trips run on Anthropic's side inside the one call; `.text`
+    keeps only the answer's text blocks.
+    """
+    question_turn = {"role": "user", "content": question}
+    messages = [("system", CHAT_SYSTEM_PROMPT)]
+    for turn in [*history, question_turn]:
+        messages.append((turn["role"], turn["content"]))
+
+    try:
+        with st.spinner("Reading your SnapTrade accounts..."):
+            reply = portfolio_chat_model().invoke(messages)
+    except Exception as error:
+        # An expired token lands here (Risk #15); the saved transcript is the fallback.
+        show_live_error("The portfolio chat", error)
+        return
+
+    history.append(question_turn)
+    history.append({"role": "assistant", "content": str(reply.text)})
+    st.rerun()
+
+
+def chat_tab() -> None:
+    """Answer plain-English portfolio questions through SnapTrade's hosted MCP (S13, stories 41-42)."""
+    if is_cloud_mode():
+        st.caption(LIVE_DEMO_NOTE)
+        transcript = read_json(CHAT_TRANSCRIPT_PATH)
+        if transcript is None:
+            st.info(NO_REPLAY_NOTE)
+        else:
+            render_chat_turns(transcript)
+        st.chat_input(CHAT_PLACEHOLDER, disabled=True)
+        return
+
+    if not is_chat_configured():
+        st.info(CHAT_SETUP_NOTE)
+        return
+
+    history = st.session_state.setdefault("chat_history", [])
+    render_chat_turns(history)
+    question = st.chat_input(CHAT_PLACEHOLDER)
+    if question:
+        ask_portfolio_chat(history, question)
+
+    if history:
+        save_replay_button("Save transcript", CHAT_TRANSCRIPT_PATH, history)
+
+
 def main() -> None:
     """Render the gated app; tabs follow the Q12 demo narrative."""
     st.set_page_config(page_title="snapi", layout="wide")
@@ -979,8 +1088,9 @@ def main() -> None:
     check_password()
     prepare_live_books()
 
-    committee_area, portfolio_area, activity_area, forward_test_area = st.tabs(
-        ["Committee", "Portfolio", "Activity", "Forward test"]
+    tab_labels = ["Committee", "Portfolio", "Activity", "Chat", "Forward test"]
+    committee_area, portfolio_area, activity_area, chat_area, forward_test_area = (
+        st.tabs(tab_labels)
     )
     with committee_area:
         committee_tab()
@@ -988,6 +1098,8 @@ def main() -> None:
         portfolio_tab()
     with activity_area:
         activity_tab()
+    with chat_area:
+        chat_tab()
     with forward_test_area:
         forward_test_tab()
 
