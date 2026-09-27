@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Literal
+from urllib.error import URLError
 
 import requests
 from fredapi import Fred
@@ -38,6 +40,10 @@ FEAR_AND_GREED_HEADERS = {
 }
 
 REQUEST_TIMEOUT_SECONDS = 10
+
+# The free tier also caps burst rate at 1 request/second (Risk #16); this is
+# pacing, not a retry.
+ALPHA_VANTAGE_PACE_SECONDS = 1
 
 # The macro checklist's non-price inputs (F13); SPY-vs-200-day-SMA lives in signals.py.
 MACRO_SERIES_IDS = ("T10Y3M", "SAHMREALTIME", "BAMLH0A0HYM2", "VIXCLS")
@@ -132,9 +138,11 @@ def fetch_alpha_vantage_news(ticker: str) -> TickerNews:
     mention every ticker. Cached to disk once a day, so a dev rerun spends no
     call (S1, Risk #16).
 
-    Raises FeedUnavailableError if the key is missing, or Alpha Vantage answers
-    HTTP 200 with a Note/Information/Error Message body (its rate-limit and
-    misconfiguration signal).
+    Raises FeedUnavailableError if the key is missing, the request times out,
+    fails to connect, comes back with an HTTP error status, or its body
+    isn't valid JSON, or Alpha Vantage answers HTTP 200 with a
+    Note/Information/Error Message body (its rate-limit and misconfiguration
+    signal).
     """
     cache_name = f"alpha_vantage-{ticker}"
     cached_payload = _read_cache(cache_name)
@@ -145,13 +153,19 @@ def fetch_alpha_vantage_news(ticker: str) -> TickerNews:
     if not api_key:
         raise FeedUnavailableError("ALPHAVANTAGE_API_KEY is not set")
 
-    response = requests.get(
-        ALPHA_VANTAGE_URL,
-        params={"function": "NEWS_SENTIMENT", "tickers": ticker, "apikey": api_key},
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
-    response.raise_for_status()
-    payload = response.json()
+    time.sleep(ALPHA_VANTAGE_PACE_SECONDS)
+    try:
+        response = requests.get(
+            ALPHA_VANTAGE_URL,
+            params={"function": "NEWS_SENTIMENT", "tickers": ticker, "apikey": api_key},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as error:
+        raise FeedUnavailableError(
+            f"Alpha Vantage request failed for {ticker!r}: {error}"
+        ) from error
 
     if "Note" in payload or "Information" in payload or "Error Message" in payload:
         raise FeedUnavailableError(
@@ -166,7 +180,9 @@ def fetch_alpaca_news(tickers: tuple[str, ...]) -> dict[str, TickerNews]:
     """Return headline-only news per ticker from Alpaca News (no sentiment field).
 
     One multi-symbol call; the Sentiment agent scores these headlines itself.
-    Raises FeedUnavailableError if the Alpaca keys are missing or the call fails.
+    Raises FeedUnavailableError if the Alpaca keys are missing, the request
+    times out, fails to connect, comes back with an HTTP error status (e.g.
+    401), or its body isn't valid JSON.
     """
     api_key_id = os.environ.get("ALPACA_API_KEY_ID")
     api_secret_key = os.environ.get("ALPACA_API_SECRET_KEY")
@@ -175,17 +191,20 @@ def fetch_alpaca_news(tickers: tuple[str, ...]) -> dict[str, TickerNews]:
             "ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY are not set"
         )
 
-    response = requests.get(
-        ALPACA_NEWS_URL,
-        params={"symbols": ",".join(tickers), "limit": 50},
-        headers={
-            "APCA-API-KEY-ID": api_key_id,
-            "APCA-API-SECRET-KEY": api_secret_key,
-        },
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
-    response.raise_for_status()
-    payload = response.json()
+    try:
+        response = requests.get(
+            ALPACA_NEWS_URL,
+            params={"symbols": ",".join(tickers), "limit": 50},
+            headers={
+                "APCA-API-KEY-ID": api_key_id,
+                "APCA-API-SECRET-KEY": api_secret_key,
+            },
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as error:
+        raise FeedUnavailableError(f"Alpaca News request failed: {error}") from error
 
     articles_by_ticker: dict[str, list[NewsArticle]] = {
         ticker: [] for ticker in tickers
@@ -232,11 +251,12 @@ def fetch_universe_news(tickers: tuple[str, ...] = UNIVERSE) -> dict[str, Ticker
     return news_by_ticker
 
 
-def fetch_fear_and_greed() -> int | None:
+def fetch_fear_and_greed() -> float | None:
     """Return today's CNN Fear & Greed score (0-100), or None if the feed is unavailable.
 
-    Cached to disk once a day. The market-level contrarian tilt (Q6) is
-    skipped in signals.py when this returns None.
+    Cached to disk once a day. The raw score is kept unrounded so the sizing
+    chain's below-25/above-75 tilt thresholds (Q6, F15) see the real value;
+    the sizing chain skips the market-level tilt (Q6) when this returns None.
     """
     cached_payload = _read_cache("fear_and_greed")
     if cached_payload is not None:
@@ -249,7 +269,7 @@ def fetch_fear_and_greed() -> int | None:
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
-        score = round(response.json()["fear_and_greed"]["score"])
+        score = float(response.json()["fear_and_greed"]["score"])
     except (requests.RequestException, KeyError, ValueError):
         return None  # unavailable -> caller skips the tilt rather than guessing
 
@@ -263,7 +283,9 @@ def fetch_macro_series() -> dict[str, float]:
     Covers T10Y3M, SAHMREALTIME, BAMLH0A0HYM2 and VIXCLS (F13); SPY against
     its 200-day SMA comes from the price snapshot instead.
 
-    Raises FeedUnavailableError if FRED_API_KEY is missing or a series has no data.
+    Raises FeedUnavailableError if FRED_API_KEY is missing, a series has no
+    data, fredapi rejects the key or request (ValueError), or the network
+    call fails (URLError).
     """
     api_key = os.environ.get("FRED_API_KEY")
     if not api_key:
@@ -271,11 +293,14 @@ def fetch_macro_series() -> dict[str, float]:
 
     fred = Fred(api_key=api_key)
     latest_value_by_series = {}
-    for series_id in MACRO_SERIES_IDS:
-        series = fred.get_series(series_id).dropna()
-        if series.empty:
-            raise FeedUnavailableError(f"FRED returned no data for {series_id!r}")
+    try:
+        for series_id in MACRO_SERIES_IDS:
+            series = fred.get_series(series_id).dropna()
+            if series.empty:
+                raise FeedUnavailableError(f"FRED returned no data for {series_id!r}")
 
-        latest_value_by_series[series_id] = float(series.iloc[-1])
+            latest_value_by_series[series_id] = float(series.iloc[-1])
+    except (ValueError, URLError) as error:
+        raise FeedUnavailableError(f"FRED request failed: {error}") from error
 
     return latest_value_by_series
