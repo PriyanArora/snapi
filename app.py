@@ -39,6 +39,7 @@ from pydantic_core import to_jsonable_python
 import config
 
 if TYPE_CHECKING:
+    from langchain_core.messages import BaseMessage
     from langchain_core.runnables import Runnable
     from streamlit.delta_generator import DeltaGenerator
 
@@ -2216,11 +2217,31 @@ def recent_chat_label(chat: dict) -> str:
     return f"{chat['title']} · {model_label} · {updated_on}"
 
 
+def reply_text(reply: BaseMessage) -> str:
+    """Return a chat reply's text blocks with a blank line between them.
+
+    langchain's `.text` joins them with nothing, so the text before and after
+    each MCP tool call ran together ("exposure.Let me try").
+    """
+    if isinstance(reply.content, str):
+        return reply.content
+
+    text_blocks = []
+    for block in reply.content:
+        if isinstance(block, str):
+            text_blocks.append(block.strip())
+        elif block.get("type") == "text":
+            text_blocks.append(block["text"].strip())
+
+    return "\n\n".join(text for text in text_blocks if text)
+
+
 def ask_portfolio_chat(chat: dict, question: str, model_name: str) -> None:
     """Answer one question with the whole conversation so far, then keep both turns and save the chat.
 
-    The MCP round trips run on Anthropic's side inside the one call; `.text`
-    keeps only the answer's text blocks. A failed call keeps and saves nothing.
+    The MCP round trips run on Anthropic's side inside the one call;
+    `reply_text` keeps only the answer's text blocks. A failed call keeps
+    and saves nothing.
     """
     import books
 
@@ -2243,7 +2264,7 @@ def ask_portfolio_chat(chat: dict, question: str, model_name: str) -> None:
         chat["created_at"] = answered_at
     chat["turns"].append(question_turn)
     chat["turns"].append(
-        {"role": "assistant", "content": str(reply.text), "model_name": model_name}
+        {"role": "assistant", "content": reply_text(reply), "model_name": model_name}
     )
     chat["model_name"] = model_name
     chat["updated_at"] = answered_at

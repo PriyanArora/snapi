@@ -1,4 +1,4 @@
-"""The Chat page's saved conversations on the local JSONL log (Recent chats).
+"""The Chat page's saved conversations on the local JSONL log (Recent chats), and its reply text.
 
 Runs offline: MONGODB_URI is unset and the log goes to a temporary folder.
 """
@@ -8,7 +8,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from langchain_core.messages import AIMessage
 
+import app
 import books
 
 
@@ -44,3 +46,18 @@ def test_a_resaved_chat_lists_once_at_its_latest_version_newest_first(
     assert [chat["chat_id"] for chat in chats] == ["first", "second"]
     assert chats[0]["turns"][-1]["content"] == "Still Technology."
     assert [chat["chat_id"] for chat in books.recent_chats(limit=1)] == ["first"]
+
+
+def test_reply_text_puts_a_blank_line_between_text_blocks() -> None:
+    """Text on either side of an MCP tool call reads as two paragraphs, never "exposure.Let me"."""
+    reply = AIMessage(
+        content=[
+            {"type": "text", "text": "Checking your exposure."},
+            {"type": "mcp_tool_use", "id": "tool_1", "name": "get_holdings"},
+            {"type": "text", "text": "Let me try another approach."},
+        ]
+    )
+
+    assert app.reply_text(reply) == (
+        "Checking your exposure.\n\nLet me try another approach."
+    )
