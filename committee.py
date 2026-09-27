@@ -165,9 +165,8 @@ class CriticNotes(BaseModel):
     notes: str
 
 
-# Sentiment, Technical, Macro, PM, Critic (in that order, over one-paragraph
-# placeholder text). The finance teammate owns the wording; this is a
-# deliberate placeholder kept in one obvious place.
+# The five agent prompts, in graph order. The finance teammate owns the
+# wording; these one-paragraph drafts stay here, in one obvious place.
 SENTIMENT_PROMPT = (
     "You are the Sentiment analyst on an investment committee. For every "
     "ticker you are shown, read its recent headlines (and any Alpha Vantage "
@@ -397,6 +396,7 @@ def _abstain_on_error(
     """
 
     def run_or_abstain(state: CommitteeState) -> dict:
+        """Return the analyst's update, or its abstained report when it raises."""
         try:
             return node(state)
         except Exception as error:
