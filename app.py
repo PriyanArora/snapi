@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import hashlib
 import hmac
 import json
 import logging
@@ -50,6 +51,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 APP_PASSWORD_ENV_VAR = "APP_PASSWORD"
+# The login is remembered in the URL as ?login=<token>, so a refresh stays
+# logged in. The token is derived from the password, never the password.
+LOGIN_QUERY_PARAM = "login"
+LOGIN_TOKEN_SALT = b"snapi-login"
 
 USER_FIRST_NAME = "Priyan"
 TAGLINE = "Turn your brokerage into your own AI hedge fund"
@@ -326,6 +331,22 @@ def is_password_correct(entered_password: str) -> bool:
     )
 
 
+def login_token() -> str:
+    """Return the URL token that proves a past login; it changes whenever APP_PASSWORD does."""
+    password = read_app_password() or ""
+    digest = hmac.new(password.encode(), LOGIN_TOKEN_SALT, hashlib.sha256)
+    return digest.hexdigest()[:32]
+
+
+def has_login_token() -> bool:
+    """Return whether the URL carries a valid login token from an earlier login."""
+    url_token = st.query_params.get(LOGIN_QUERY_PARAM)
+    if not url_token or not read_app_password():
+        return False
+
+    return hmac.compare_digest(url_token.encode(), login_token().encode())
+
+
 def render_logo() -> None:
     """Draw the Snapi wordmark in its serif italic logo font."""
     st.html('<div class="snapi-logo">Snapi</div>')
@@ -359,7 +380,11 @@ def render_login_card() -> tuple[str, bool]:
                             key="continue",
                             stretch=True,
                         )
-                        login.text(config.DISCLAIMER, variant="caption")
+                        # Shown for the demo, so judges can log in.
+                        login.text(
+                            f"{config.DISCLAIMER} Demo password: {read_app_password()}",
+                            variant="caption",
+                        )
 
     entered_password = password_field.value or ""
     if show_button.clicked:
@@ -373,6 +398,11 @@ def render_login_card() -> tuple[str, bool]:
 def check_password() -> None:
     """Show the login page and stop the script until the password matches APP_PASSWORD (S9, T17, Q13)."""
     if st.session_state.get("password_ok"):
+        return
+
+    # A refresh keeps the URL, so an earlier login's token skips the page.
+    if has_login_token():
+        st.session_state["password_ok"] = True
         return
 
     st.html(LOGIN_PAGE_CSS)
@@ -393,6 +423,7 @@ def check_password() -> None:
 
         if is_password_correct(entered_password):
             st.session_state["password_ok"] = True
+            st.query_params[LOGIN_QUERY_PARAM] = login_token()
             st.rerun()
 
         ui.alert(
