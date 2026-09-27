@@ -21,7 +21,7 @@ import brokerage
 import prices
 from books import SEED_PERSONAS, ApprovalRecord, FillTag
 from committee import Proposal
-from config import PERSONAS, UNIVERSE
+from config import PERSONAS, UNIVERSE, Regime
 from external.broker_models import Fill, Order
 from external.models import Signal
 from portfolio import MODEL_WEIGHTS, Book, build_orders_for_targets, size_persona
@@ -189,29 +189,36 @@ def _equal_conviction_signals() -> list[Signal]:
     return equal_signals
 
 
-def _seed_if_empty(persona_key: str) -> list[Fill]:
-    """Give one simulator persona its opening book at Friday's close, once (S16).
+def _seed_proposal(persona_key: str, regime: Regime) -> Proposal:
+    """Return the equal-conviction opening proposal for the persona's empty book (S16).
 
-    Equal conviction through the same sizing chain, cap layer and
-    `execute` as an approved run; no LLM call and no F&G tilt.
+    Equal conviction through the same sizing chain and cap layer as an
+    approved run; no LLM call and no F&G tilt.
     """
-    # A restart must never double-seed (story 58).
-    if books.has_fills(persona_key):
-        return []
-
+    persona = PERSONAS[persona_key]
+    empty_book = Book(cash=persona.starting_cash, shares={}, avg_cost={})
     sized = size_persona(
-        PERSONAS[persona_key],
+        persona,
         _equal_conviction_signals(),
-        books.current_regime(),
-        books.load_book(persona_key),
+        regime,
+        empty_book,
         prices.latest_marks(),
         fear_greed=None,
         dropped_tickers=set(),
     )
-    proposal = Proposal(
+    return Proposal(
         target_weights={persona_key: sized.target_weights},
         orders={persona_key: sized.orders},
     )
+
+
+def _seed_if_empty(persona_key: str) -> list[Fill]:
+    """Give one simulator persona its opening book at Friday's close, once, through `execute` (S16)."""
+    # A restart must never double-seed (story 58).
+    if books.has_fills(persona_key):
+        return []
+
+    proposal = _seed_proposal(persona_key, books.current_regime())
     return execute(proposal, persona_key, tag="seed")
 
 
@@ -223,9 +230,17 @@ def seed_books() -> None:
 
 def reset_books() -> None:
     """Clear the simulated fill logs and seed them again, for a clean rehearsal (S16 Reset books)."""
+    # Size the new opening books before deleting anything: if FRED is down,
+    # the regime read raises here and the old books stay in place.
+    regime = books.current_regime()
+    seed_proposals = {}
+    for persona_key in SEED_PERSONAS:
+        seed_proposals[persona_key] = _seed_proposal(persona_key, regime)
+
     for persona_key, persona in PERSONAS.items():
         # Balanced only has a fill log under R5's simulator fallback.
         if persona.account == "simulator":
             books.fills_path(persona_key).unlink(missing_ok=True)
 
-    seed_books()
+    for persona_key, proposal in seed_proposals.items():
+        execute(proposal, persona_key, tag="seed")
