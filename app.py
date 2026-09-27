@@ -1164,6 +1164,15 @@ def render_approval_section(run_record: dict, is_approvable: bool) -> None:
     render_execution(approval["persona"], approval["outcome"])
 
 
+def default_model_label() -> str | None:
+    """Return SNAPI_MODEL's label for the Model selects, or None (their first option) when it isn't one of MODEL_CHOICES."""
+    default_label = config.get_model_label(config.get_model_name())
+    if default_label not in config.MODEL_CHOICES:
+        return None
+
+    return default_label
+
+
 def render_prompt_bar(is_running: bool) -> tuple[str, str, bool]:
     """Draw the model, the question and Run swarm in one row; return the question, the model id and whether Run swarm was clicked.
 
@@ -1173,16 +1182,12 @@ def render_prompt_bar(is_running: bool) -> tuple[str, str, bool]:
     soon as it changes.
     """
     missing_run_keys = missing_keys(ANTHROPIC_KEY_ENV_VAR, FRED_KEY_ENV_VAR)
-    model_labels = list(config.MODEL_CHOICES)
-    default_label = config.get_model_label(config.get_model_name())
-    if default_label not in model_labels:
-        default_label = None
 
     with st.container(horizontal=True):
         model_label = ui.select(
             "Model",
-            model_labels,
-            value=default_label,
+            list(config.MODEL_CHOICES),
+            value=default_model_label(),
             key="model",
             width=MODEL_SELECT_WIDTH,
         )
@@ -2308,7 +2313,7 @@ def render_chat_controls(chat: dict) -> str:
         model_label = ui.select(
             "Model",
             list(config.MODEL_CHOICES),
-            value=config.get_model_label(config.get_model_name()),
+            value=default_model_label(),
             key="chat_model",
             width=CHAT_MODEL_SELECT_WIDTH,
         )
