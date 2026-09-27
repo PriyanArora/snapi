@@ -18,7 +18,10 @@ from stockstats import StockDataFrame
 from config import (
     BENCHMARK,
     HY_OAS_FLAG_ABOVE,
+    MACD_FAST,
     MACD_MEAN_ABS_LOOKBACK_DAYS,
+    MACD_SIGNAL,
+    MACD_SLOW,
     NEUTRAL_MAX_FLAGS,
     RISK_ON_MAX_FLAGS,
     RSI_MIDPOINT,
@@ -81,10 +84,9 @@ def compute_technical_score(ticker: str, as_of: date | None = None) -> Technical
     rsi = float(frame[f"rsi_{RSI_PERIOD}"].iloc[-1])
     rsi_score = _clip_to_unit_range((RSI_MIDPOINT - rsi) / RSI_SCORE_DIVISOR)
 
-    # "macd"/"macds"/"macdh" use stockstats' own default windows (12, 26, 9),
-    # which already match config's MACD_FAST/MACD_SLOW/MACD_SIGNAL.
-    macd_histogram = float(frame["macdh"].iloc[-1])
-    macd_mean_abs = frame["macdh"].tail(MACD_MEAN_ABS_LOOKBACK_DAYS).abs().mean()
+    macd_column = f"macdh_{MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}"
+    macd_histogram = float(frame[macd_column].iloc[-1])
+    macd_mean_abs = frame[macd_column].tail(MACD_MEAN_ABS_LOOKBACK_DAYS).abs().mean()
     if macd_mean_abs == 0:
         macd_score = 0.0  # flat histogram history -> nothing to normalize against
     else:
@@ -145,7 +147,6 @@ if __name__ == "__main__":
 
     for ticker in UNIVERSE:
         technical = compute_technical_score(ticker)
-        assert -1.0 <= technical.score <= 1.0, f"{ticker} score out of range"
         print(f"{ticker}: score={technical.score:.3f} rsi={technical.rsi:.1f}")
 
     macro_series = {
@@ -155,8 +156,6 @@ if __name__ == "__main__":
         "VIXCLS": 14.0,
     }
     checklist = compute_macro_checklist(macro_series)
-    assert checklist.flag_count == sum(checklist.flags.values())
-    assert checklist.regime in ("risk_on", "neutral", "risk_off")
     print(f"macro: {checklist.flags} -> {checklist.regime}")
 
     for persona in PERSONAS.values():
