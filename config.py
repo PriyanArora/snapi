@@ -13,55 +13,58 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-# Universe and benchmark (Q1)
+# Universe and benchmark (Q1). Phase11 replaced Q1's list with household
+# names across 7 SPDR sectors.
 UNIVERSE = (
-    "NVDA",
-    "AMD",
-    "AVGO",
-    "JPM",
-    "XOM",
-    "UNH",
     "AAPL",
     "MSFT",
+    "NVDA",
+    "GOOGL",
+    "META",
     "AMZN",
-    "CAT",
+    "TSLA",
+    "KO",
+    "JPM",
+    "XOM",
+    "JNJ",
 )
 BENCHMARK = "SPY"
 
-# Sector buckets (F9) and their membership (Q2, Q3).
+# Sector buckets (F9) and their membership (Q2, Q3), one SPDR sector ETF each.
 # ETFs map to their own bucket too, so SECTOR_BY_TICKER covers both stocks
 # and the ETFs used for rebalance buys.
 SECTORS = (
-    "Semiconductors",
-    "Banks",
+    "Technology",
+    "Communication",
+    "Consumer",
+    "Staples",
+    "Financials",
     "Energy",
     "Healthcare",
-    "Big Tech",
-    "Consumer",
-    "Industrials",
 )
 
 ETF_BY_SECTOR = {
-    "Semiconductors": "SMH",
-    "Banks": "KBE",
+    "Technology": "XLK",
+    "Communication": "XLC",
+    "Consumer": "XLY",
+    "Staples": "XLP",
+    "Financials": "XLF",
     "Energy": "XLE",
     "Healthcare": "XLV",
-    "Big Tech": "XLK",
-    "Consumer": "XLY",
-    "Industrials": "XLI",
 }
 
 _STOCK_SECTOR_BY_TICKER = {
-    "NVDA": "Semiconductors",
-    "AMD": "Semiconductors",
-    "AVGO": "Semiconductors",
-    "JPM": "Banks",
+    "AAPL": "Technology",
+    "MSFT": "Technology",
+    "NVDA": "Technology",
+    "GOOGL": "Communication",
+    "META": "Communication",
+    "AMZN": "Consumer",
+    "TSLA": "Consumer",
+    "KO": "Staples",
+    "JPM": "Financials",
     "XOM": "Energy",
-    "UNH": "Healthcare",
-    "AAPL": "Big Tech",
-    "MSFT": "Big Tech",
-    "AMZN": "Big Tech",
-    "CAT": "Industrials",
+    "JNJ": "Healthcare",
 }
 SECTOR_BY_TICKER = _STOCK_SECTOR_BY_TICKER | {
     etf: sector for sector, etf in ETF_BY_SECTOR.items()

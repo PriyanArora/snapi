@@ -1,6 +1,6 @@
 """Seam 3: rebalance(book, persona) -> orders (PRD Testing Decisions).
 
-Setup: a synthetic book of 70% semis under the Balanced persona's 30%
+Setup: a synthetic book of 70% Technology under the Balanced persona's 30%
 sector cap (test data only, not a demo book). Checks the outcome a user
 would notice, at the SimBroker seam: caps hold after the orders fill, the
 trim is pro-rata, and the freed weight lands in the most-underweight
@@ -20,17 +20,17 @@ BALANCED = config.PERSONAS["balanced"]
 
 MARKS = {ticker: 100.0 for ticker in config.SECTOR_BY_TICKER}
 
-# 70% semis (NVDA/AMD/AVGO), a few other small sectors, Consumer left at 0%
-# (it has no stock per Q2) so it is unambiguously the most-underweight bucket.
+# 70% Technology (AAPL/MSFT/NVDA), a few other small sectors, Consumer left
+# at 0% so it is unambiguously the most-underweight bucket.
 SEED_SHARES = {
-    "NVDA": 233,
-    "AMD": 233,
-    "AVGO": 234,
-    "JPM": 50,  # Banks
+    "AAPL": 233,
+    "MSFT": 233,
+    "NVDA": 234,
+    "GOOGL": 50,  # Communication
     "XOM": 30,  # Energy
-    "UNH": 20,  # Healthcare
-    "AAPL": 40,  # Big Tech
-    "CAT": 10,  # Industrials
+    "JNJ": 20,  # Healthcare
+    "KO": 40,  # Staples
+    "JPM": 10,  # Financials
 }
 SEED_CASH = 15_000.0
 
@@ -39,25 +39,25 @@ def _seeded_book() -> Book:
     return Book(cash=SEED_CASH, shares=dict(SEED_SHARES), avg_cost={})
 
 
-def test_rebalance_trims_semis_and_refills_underweight_etf() -> None:
-    """One rebalance run trims semis pro-rata, buys Consumer's ETF and stays under cap.
+def test_rebalance_trims_technology_and_refills_underweight_etf() -> None:
+    """One rebalance run trims Technology pro-rata, buys Consumer's ETF and stays under cap.
 
     Checks all of seam 3 in one pass: the 30% cap holds after the orders
-    fill, the semis trim is pro-rata, and the weight it frees buys the
-    most-underweight bucket's ETF (Consumer, left at 0% per Q2) (R10).
+    fill, the Technology trim is pro-rata, and the weight it frees buys the
+    most-underweight bucket's ETF (Consumer, left at 0%) (R10).
     """
     book = _seeded_book()
     before = sector_weights(book, MARKS)
-    assert before["Semiconductors"] == pytest.approx(0.70)
+    assert before["Technology"] == pytest.approx(0.70)
 
     target = weights_by_ticker(book, MARKS)
     invested_pct = BALANCED.invested_pct_for_regime("risk_on")
     result = rebalance(book, BALANCED, target, MARKS, invested_pct)
 
-    assert result.after_sector_weights["Semiconductors"] <= BALANCED.sector_cap + 1e-9
+    assert result.after_sector_weights["Technology"] <= BALANCED.sector_cap + 1e-9
 
-    scale = BALANCED.sector_cap / before["Semiconductors"]
-    for ticker in ("NVDA", "AMD", "AVGO"):
+    scale = BALANCED.sector_cap / before["Technology"]
+    for ticker in ("AAPL", "MSFT", "NVDA"):
         assert result.target_weights[ticker] == pytest.approx(target[ticker] * scale)
 
     consumer_etf = config.ETF_BY_SECTOR["Consumer"]

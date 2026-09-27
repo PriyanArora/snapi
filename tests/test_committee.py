@@ -39,10 +39,10 @@ from signals import MacroChecklist, TechnicalScore
 ALL_TICKERS = tuple(config.SECTOR_BY_TICKER)
 FIXTURE_MARKS = {ticker: 100.0 for ticker in ALL_TICKERS}
 
-# Semis and Big Tech carry a strong positive score so the per-name max and
-# the sector caps actually bind; the rest sit in a narrow, mild-conviction
-# range so they don't compete for the same limits.
-_STRONG_TICKERS = {"NVDA", "AMD", "AVGO", "AAPL", "MSFT", "AMZN"}
+# Technology and Communication carry a strong positive score so the per-name
+# max and the sector caps actually bind; the rest sit in a narrow,
+# mild-conviction range so they don't compete for the same limits.
+_STRONG_TICKERS = {"AAPL", "MSFT", "NVDA", "GOOGL", "META"}
 
 
 def _technical_score(ticker: str) -> TechnicalScore:
@@ -72,15 +72,15 @@ FIXTURE_MACRO = MacroChecklist(
     regime="risk_on",
 )
 # Balanced already holds a within-sector mix that sits just under the 30%
-# semis cap (NVDA 135, AMD 142, AVGO 143 at the $100 fixture mark): rotating
-# toward this cycle's equal-weight semis targets sells 1 share of one name
+# Technology cap (AAPL 135, MSFT 142, NVDA 143 at the $100 fixture mark): rotating
+# toward this cycle's equal-weight Technology targets sells 1 share of one name
 # while buying several of another, so the $200 floor (F11) and the cap
 # restore it can't override (F7, deviation #7) both fire for real.
 FIXTURE_BOOKS = {
     "conservative": Book(cash=100_000.0, shares={}, avg_cost={}),
     "balanced": Book(
         cash=100_000.0,
-        shares={"NVDA": 135, "AMD": 142, "AVGO": 143},
+        shares={"AAPL": 135, "MSFT": 142, "NVDA": 143},
         avg_cost={},
     ),
     "aggressive": Book(cash=100_000.0, shares={}, avg_cost={}),
@@ -109,7 +109,7 @@ NARRATION_ANSWER = Narration(
     notes=[Note(name=name, why="in line with the numbers") for name in config.UNIVERSE]
 )
 PM_ANSWER = PMView(
-    memo="Leaning into semis and Big Tech; trimming energy on weak conviction.",
+    memo="Leaning into Technology and Communication; trimming energy on weak conviction.",
     drops=[Drop(ticker="XOM", reason="conviction too weak to size")],
 )
 CRITIC_ANSWER = CriticNotes(notes="Concentration risk in a handful of mega-cap names.")
