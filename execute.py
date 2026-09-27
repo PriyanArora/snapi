@@ -1,4 +1,4 @@
-"""Approve -> paper orders: `execute(proposal, persona)`.
+"""Approve -> paper orders: `execute(proposal, persona)` and the S16 seed.
 
 `execute` is the only path that trades (story 22, T18). It re-reads the
 persona's book, re-derives whole-share orders from the approved target
@@ -7,21 +7,24 @@ routes by account: Balanced to Alpaca Paper through SnapTrade (queued until
 the next open, locked while any order is still open, R4), Conservative and
 Aggressive to their SimBroker at the snapshot mark. A rerun on the same
 targets finds the book already there and places nothing (seam 2).
+
+The seed lives here, not in books.py, because it calls `execute`.
 """
 
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import books
 import brokerage
 import prices
-from books import ApprovalRecord, FillTag
+from books import SEED_PERSONAS, ApprovalRecord, FillTag
 from committee import Proposal
-from config import PERSONAS
+from config import PERSONAS, UNIVERSE
 from external.broker_models import Fill, Order
-from portfolio import Book, build_orders_for_targets
+from external.models import Signal
+from portfolio import MODEL_WEIGHTS, Book, build_orders_for_targets, size_persona
 
 
 class ExecutionLockedError(Exception):
@@ -148,3 +151,58 @@ def execute(
         return _execute_on_alpaca_paper(persona_key, target_weights, marks, tag)
 
     return _execute_on_simulator(persona_key, target_weights, marks, tag)
+
+
+def _equal_conviction_signals() -> list[Signal]:
+    """Return a full-conviction vote from both analysts on every name (Q14 default a)."""
+    as_of = date.today().isoformat()
+    equal_signals = []
+    for model_name in MODEL_WEIGHTS:
+        for ticker in UNIVERSE:
+            equal_signals.append(
+                Signal(model_name=model_name, ticker=ticker, date=as_of, value=1.0)
+            )
+
+    return equal_signals
+
+
+def _seed_if_empty(persona_key: str) -> list[Fill]:
+    """Give one simulator persona its opening book at Friday's close, once (S16).
+
+    Equal conviction through the same sizing chain, cap layer and
+    `execute` as an approved run; no LLM call and no F&G tilt.
+    """
+    # A restart must never double-seed (story 58).
+    if books.has_fills(persona_key):
+        return []
+
+    sized = size_persona(
+        PERSONAS[persona_key],
+        _equal_conviction_signals(),
+        books.current_regime(),
+        books.load_book(persona_key),
+        prices.latest_marks(),
+        fear_greed=None,
+        dropped_tickers=set(),
+    )
+    proposal = Proposal(
+        target_weights={persona_key: sized.target_weights},
+        orders={persona_key: sized.orders},
+    )
+    return execute(proposal, persona_key, tag="seed")
+
+
+def seed_books() -> None:
+    """Seed Conservative and Aggressive when their fill logs are empty; Balanced is never seeded (S16)."""
+    for persona_key in SEED_PERSONAS:
+        _seed_if_empty(persona_key)
+
+
+def reset_books() -> None:
+    """Clear the simulated fill logs and seed them again, for a clean rehearsal (S16 Reset books)."""
+    for persona_key, persona in PERSONAS.items():
+        # Balanced only has a fill log under R5's simulator fallback.
+        if persona.account == "simulator":
+            books.fills_path(persona_key).unlink(missing_ok=True)
+
+    seed_books()
