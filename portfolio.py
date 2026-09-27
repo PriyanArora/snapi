@@ -17,6 +17,11 @@ import config
 from external.broker_models import Order, Position
 from external.execution import build_orders
 
+# build_orders floors weight*equity/mark to whole shares; a target that
+# should equal the current holding can land a float hair under it, so
+# nudge equity up before flooring rather than after (finding: blocking).
+SHARE_ROUNDING_TOLERANCE = 1e-9
+
 
 @dataclass(frozen=True)
 class Book:
@@ -73,22 +78,23 @@ def sector_weights(book: Book, marks: dict[str, float]) -> dict[str, float]:
 def _carry_forward_held_etfs(
     target_weights: dict[str, float],
     book: Book,
-    marks: dict[str, float],
 ) -> dict[str, float]:
     """Add any bucket ETF the book still holds but that `target_weights` left out.
 
-    The sized proposal only scores UNIVERSE stocks, so an ETF bought by an
-    earlier refill would otherwise be missing from the targets — and
-    `build_orders` closes any name missing from the targets.
+    Carried at weight 0.0, not at the ETF's current weight: `build_orders`
+    closes any name missing from the targets, so the ETF still needs an
+    entry here, but the refill pool (sized off invested %, not off this
+    dict) re-derives its real weight every cycle. Carrying the current
+    weight instead would stack a fresh refill on top of it each cycle and
+    push gross past invested % (Sizing chain steps 3-4).
     """
-    equity = _equity(book, marks)
     bucket_etfs = set(config.ETF_BY_SECTOR.values())
     carried = dict(target_weights)
 
-    for ticker, shares in book.shares.items():
+    for ticker in book.shares:
         if ticker in carried or ticker not in bucket_etfs:
             continue
-        carried[ticker] = shares * marks[ticker] / equity
+        carried[ticker] = 0.0
 
     return carried
 
@@ -96,13 +102,9 @@ def _carry_forward_held_etfs(
 def _trim_over_cap_sectors(
     weights: dict[str, float],
     sector_cap: float,
-) -> tuple[dict[str, float], float]:
-    """Scale each over-cap bucket's tickers pro-rata down to the cap (F8).
-
-    Returns the trimmed weights and the total weight freed by the trims.
-    """
+) -> dict[str, float]:
+    """Scale each over-cap bucket's tickers pro-rata down to the cap (F8)."""
     trimmed = dict(weights)
-    freed_weight = 0.0
 
     for sector in config.SECTORS:
         tickers_in_sector = [
@@ -117,9 +119,8 @@ def _trim_over_cap_sectors(
         scale = sector_cap / sector_weight
         for ticker in tickers_in_sector:
             trimmed[ticker] *= scale
-        freed_weight += sector_weight - sector_cap
 
-    return trimmed, freed_weight
+    return trimmed
 
 
 def _refill_underweight_etfs(
@@ -173,19 +174,50 @@ def _positions(book: Book) -> dict[str, Position]:
     }
 
 
+def _weights_after_orders(
+    book: Book,
+    orders: list[Order],
+    marks: dict[str, float],
+    equity: float,
+) -> dict[str, float]:
+    """Return each ticker's weight after `orders` fill, not the pre-floor target.
+
+    A cap-restoring sell can fall under the $200 floor and get dropped
+    (F7 vs F11), so the book's real post-trade weight can sit above the
+    target the floor left on paper. The before/after view reports this,
+    the book that actually results, rather than the untouched target.
+    """
+    shares_after = dict(book.shares)
+    for order in orders:
+        delta = order.quantity if order.side == "buy" else -order.quantity
+        shares_after[order.ticker] = shares_after.get(order.ticker, 0) + delta
+
+    return {
+        ticker: shares * marks[ticker] / equity
+        for ticker, shares in shares_after.items()
+        if shares != 0
+    }
+
+
 def rebalance(
     book: Book,
     persona: config.Persona,
     target_weights: dict[str, float],
     marks: dict[str, float],
+    invested_pct: float,
     caps_persona: config.Persona | None = None,
 ) -> RebalanceResult:
-    """Trim over-cap sectors and refill underweight ETFs (F7, F8, F6, S8).
+    """Trim over-cap sectors and refill underweight ETFs (F7, F8, F6, Q9, S8).
 
     `target_weights` is the proposal to enforce caps on: the sized weights
     for the automatic cycle, or `weights_by_ticker(book, marks)` for the
-    Rebalance button. `caps_persona` lets a book be checked against a
-    stricter persona's caps (R3); it defaults to `persona`.
+    Rebalance button. `invested_pct` is the persona's target invested % at
+    the current regime (`persona.invested_pct_for_regime(regime)`): Q9's
+    equal-weight target is `invested_pct / 7`, and the refill pool is
+    whatever of `invested_pct` the sector trims and per-name clamps left
+    unallocated — so gross can never grow past `invested_pct`. `caps_persona`
+    lets a book be checked against a stricter persona's caps (R3); it
+    defaults to `persona`.
 
     Builds whole-share orders with `build_orders` and drops any order
     under `config.MIN_TRADE_USD` (F11, sizing chain steps 4-5).
@@ -193,22 +225,28 @@ def rebalance(
     caps_persona = caps_persona or persona
     before_sector_weights = sector_weights(book, marks)
 
-    working_weights = _carry_forward_held_etfs(target_weights, book, marks)
-    equal_weight_target = sum(working_weights.values()) / len(config.SECTORS)
+    working_weights = _carry_forward_held_etfs(target_weights, book)
+    equal_weight_target = invested_pct / len(config.SECTORS)
 
-    trimmed_weights, freed_weight = _trim_over_cap_sectors(
-        working_weights,
-        caps_persona.sector_cap,
-    )
+    trimmed_weights = _trim_over_cap_sectors(working_weights, caps_persona.sector_cap)
+    refill_pool = max(0.0, invested_pct - sum(trimmed_weights.values()))
     final_weights = _refill_underweight_etfs(
         trimmed_weights,
-        freed_weight,
+        refill_pool,
         equal_weight_target,
         caps_persona.sector_cap,
     )
 
     equity = _equity(book, marks)
-    orders = build_orders(final_weights, _positions(book), marks, equity)
+    # Absorbs float round-trip error (e.g. weight*equity/mark landing a hair
+    # under a held share count) before build_orders floors shares, so a
+    # target equal to the current weight never emits a spurious 1-share sell.
+    orders = build_orders(
+        final_weights,
+        _positions(book),
+        marks,
+        equity * (1 + SHARE_ROUNDING_TOLERANCE),
+    )
     sized_orders = [
         order
         for order in orders
@@ -219,35 +257,7 @@ def rebalance(
         target_weights=final_weights,
         orders=sized_orders,
         before_sector_weights=before_sector_weights,
-        after_sector_weights=_sector_totals(final_weights),
+        after_sector_weights=_sector_totals(
+            _weights_after_orders(book, sized_orders, marks, equity)
+        ),
     )
-
-
-if __name__ == "__main__":
-    balanced = config.PERSONAS["balanced"]
-    demo_marks = {ticker: 100.0 for ticker in config.SECTOR_BY_TICKER}
-    demo_book = Book(
-        cash=15_000.0,
-        shares={
-            "NVDA": 233,
-            "AMD": 233,
-            "AVGO": 234,
-            "JPM": 50,
-            "XOM": 30,
-            "UNH": 20,
-            "AAPL": 40,
-            "CAT": 10,
-        },
-        avg_cost={},
-    )
-    demo_target = weights_by_ticker(demo_book, demo_marks)
-    result = rebalance(demo_book, balanced, demo_target, demo_marks)
-
-    assert result.after_sector_weights["Semiconductors"] <= balanced.sector_cap + 1e-9
-    assert all(
-        weight <= balanced.sector_cap + 1e-9
-        for weight in result.after_sector_weights.values()
-    )
-    print("before:", {k: round(v, 3) for k, v in result.before_sector_weights.items()})
-    print("after:", {k: round(v, 3) for k, v in result.after_sector_weights.items()})
-    print(f"{len(result.orders)} orders")

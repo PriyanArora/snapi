@@ -39,14 +39,20 @@ def _seeded_book() -> Book:
     return Book(cash=SEED_CASH, shares=dict(SEED_SHARES), avg_cost={})
 
 
-def test_semis_trimmed_pro_rata_to_the_cap() -> None:
-    """A 70% semis book is trimmed to the 30% cap, each name shrinking by the same factor."""
+def test_rebalance_trims_semis_and_refills_underweight_etf() -> None:
+    """One rebalance run trims semis pro-rata, buys Consumer's ETF and stays under cap.
+
+    Checks all of seam 3 in one pass: the 30% cap holds after the orders
+    fill, the semis trim is pro-rata, and the weight it frees buys the
+    most-underweight bucket's ETF (Consumer, left at 0% per Q2) (R10).
+    """
     book = _seeded_book()
     before = sector_weights(book, MARKS)
     assert before["Semiconductors"] == pytest.approx(0.70)
 
     target = weights_by_ticker(book, MARKS)
-    result = rebalance(book, BALANCED, target, MARKS)
+    invested_pct = BALANCED.invested_pct_for_regime("risk_on")
+    result = rebalance(book, BALANCED, target, MARKS, invested_pct)
 
     assert result.after_sector_weights["Semiconductors"] <= BALANCED.sector_cap + 1e-9
 
@@ -54,31 +60,13 @@ def test_semis_trimmed_pro_rata_to_the_cap() -> None:
     for ticker in ("NVDA", "AMD", "AVGO"):
         assert result.target_weights[ticker] == pytest.approx(target[ticker] * scale)
 
-
-def test_freed_weight_buys_the_most_underweight_etf() -> None:
-    """The weight trimmed from semis buys Consumer's ETF first, the sector left at 0%."""
-    book = _seeded_book()
-    target = weights_by_ticker(book, MARKS)
-    result = rebalance(book, BALANCED, target, MARKS)
-
     consumer_etf = config.ETF_BY_SECTOR["Consumer"]
     assert result.target_weights[consumer_etf] > 0
-    assert (
-        result.after_sector_weights["Consumer"] == result.target_weights[consumer_etf]
-    )
-
     consumer_order = next(
         order for order in result.orders if order.ticker == consumer_etf
     )
     assert consumer_order.side == "buy"
     assert consumer_order.quantity > 0
-
-
-def test_no_sector_ends_above_its_cap_after_the_orders_fill() -> None:
-    """Applying the orders on a SimBroker never leaves a sector above the persona's cap."""
-    book = _seeded_book()
-    target = weights_by_ticker(book, MARKS)
-    result = rebalance(book, BALANCED, target, MARKS)
 
     # Open the SimBroker at the book's starting equity, then buy the seed
     # positions, so it lands on the same cash the seeded Book already has
