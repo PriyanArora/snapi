@@ -16,8 +16,10 @@ import hmac
 import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import plotly.graph_objects as go
 import streamlit as st
@@ -43,6 +45,9 @@ SANDBOX_SETUP_NOTE = (
     "Not configured. Set SNAPTRADE_CONSUMER_KEY, SNAPTRADE_CLIENT_ID and "
     "SNAPTRADE_SANDBOX_ACCOUNT_ID in .env to show the Sandbox's demo holdings."
 )
+
+NEW_YORK = ZoneInfo("America/New_York")
+SATURDAY = 5  # datetime.weekday(): Monday is 0
 
 ANALYSTS = ("sentiment", "technical", "macro")
 CARD_TITLES = {
@@ -360,6 +365,15 @@ def execute_personas(proposal: Proposal, persona_keys: list[str], tag: str) -> d
     return {"notes": notes, "records": new_records}
 
 
+def next_open_phrase(approved_at: str) -> str:
+    """Name the open that orders sent at `approved_at` wait for: Monday's on a weekend, else the next one."""
+    approved_in_new_york = datetime.fromisoformat(approved_at).astimezone(NEW_YORK)
+    if approved_in_new_york.weekday() >= SATURDAY:
+        return "Monday's 09:30 ET open"
+
+    return "the next market open"
+
+
 def render_approval_record(record: dict) -> None:
     """Show one executed batch: SnapTrade's acknowledgements for Balanced, simulator fills for the others.
 
@@ -368,8 +382,9 @@ def render_approval_record(record: dict) -> None:
     """
     if record["acks"]:
         st.success(
-            "Sent through SnapTrade to Alpaca Paper: queued for Monday's "
-            "09:30 ET open. Each order's acknowledgement is below."
+            "Sent through SnapTrade to Alpaca Paper: queued until "
+            f"{next_open_phrase(record['approved_at'])}. Each order's "
+            "acknowledgement is below."
         )
         ack_rows = []
         for ack in record["acks"]:
