@@ -290,18 +290,19 @@ def _news_prompt(news: dict[str, TickerNews]) -> str:
 
 def sentiment_node(state: CommitteeState) -> dict[str, Report]:
     """Sentiment analyst: the LLM scores each ticker's news; scores are clipped to [-1, 1] in code."""
-    answer = ask(
-        "sentiment",
-        SENTIMENT_PROMPT,
-        _news_prompt(state["snapshot"].news),
-        SentimentAnswer,
-    )
+    news = state["snapshot"].news
+    answer = ask("sentiment", SENTIMENT_PROMPT, _news_prompt(news), SentimentAnswer)
+    tickers_with_headlines = {
+        ticker for ticker, ticker_news in news.items() if ticker_news.articles
+    }
 
     scores = {}
     reasons = {}
     for view in answer.views:
         if view.ticker not in config.UNIVERSE:
             continue  # only the universe it was shown can be scored
+        if view.ticker not in tickers_with_headlines:
+            continue  # a score with no headlines is invented; technical stands alone
         scores[view.ticker] = max(-1.0, min(1.0, view.score))
         reasons[view.ticker] = view.why
 

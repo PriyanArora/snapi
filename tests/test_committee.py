@@ -32,7 +32,7 @@ from committee import (
 )
 from external.broker_models import Order
 from external.sim import SimBroker
-from feeds import TickerNews
+from feeds import NewsArticle, TickerNews
 from portfolio import Book
 from signals import MacroChecklist, TechnicalScore
 
@@ -53,8 +53,11 @@ def _technical_score(ticker: str) -> TechnicalScore:
 
 
 FIXTURE_TECHNICAL = {ticker: _technical_score(ticker) for ticker in config.UNIVERSE}
+FIXTURE_ARTICLE = NewsArticle(
+    title="Quarterly results in line", source="Wire", published_at="20260925T120000"
+)
 FIXTURE_NEWS = {
-    ticker: TickerNews(source="alpha_vantage", articles=[])
+    ticker: TickerNews(source="alpha_vantage", articles=[FIXTURE_ARTICLE])
     for ticker in config.UNIVERSE
 }
 FIXTURE_MACRO = MacroChecklist(
