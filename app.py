@@ -129,10 +129,9 @@ header[data-testid="stHeader"] { display: none; }
   border-radius: 16px;
   box-shadow: 0 8px 24px rgba(15, 27, 61, 0.06);
 }
-/* Ghost buttons hover with --accent: a light yellow in the navbar. */
+/* Ghost buttons hover with --muted: a light yellow in the navbar. */
 .st-key-navbar [data-ssui-v2-host] {
-  --accent: #FFF1B8;
-  --accent-foreground: #0F1B3D;
+  --muted: #FFF1B8;
   --text-sm: 0.95rem;
 }
 .st-key-nav_logo [data-ssui-v2-host] {
