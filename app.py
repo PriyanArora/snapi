@@ -142,12 +142,12 @@ header[data-testid="stHeader"] { display: none; }
   --font-weight-medium: 800;
   --spacing: 0.26rem;
 }
+/* No backdrop blur on content cards: Chrome left their shadcn content
+   unpainted after login until a tab switch forced a repaint. */
 [class*="st-key-brokerage_card_"],
 [class*="st-key-order_card_"],
 [class*="st-key-pending_node_"] {
-  background: rgba(255, 255, 255, 0.7);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  background: rgba(255, 255, 255, 0.82);
   border-radius: 14px;
 }
 .snapi-hero { margin: 4rem 0 0; }
@@ -180,9 +180,7 @@ header[data-testid="stHeader"] { display: none; }
   color: #0F1B3D;
 }
 [class*="st-key-portfolio_card_"] {
-  background: rgba(255, 255, 255, 0.7);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  background: rgba(255, 255, 255, 0.82);
   border-radius: 14px;
 }
 </style>
