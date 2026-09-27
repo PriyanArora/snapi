@@ -141,7 +141,9 @@ class FakeChatModel:
 
 
 @pytest.fixture
-def use_fake_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def use_fake_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Callable[[dict[type, object]], None]:
     """Route committee.ask through a fake model and an isolated, throwaway cache dir."""
 
     def _install(answers: dict[type, object]) -> None:

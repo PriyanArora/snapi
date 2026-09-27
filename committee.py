@@ -39,7 +39,9 @@ from signals import MacroChecklist, TechnicalScore
 
 # R12: tracing off, pinned here rather than left to the shell default, since
 # it would otherwise send prompts and portfolio data to a third-party cloud.
-os.environ["LANGSMITH_TRACING"] = "false"
+# LangSmith reads LANGSMITH_TRACING_V2 before LANGCHAIN_TRACING_V2 and
+# LANGSMITH_TRACING, so this one name wins over any of them set in a shell.
+os.environ["LANGSMITH_TRACING_V2"] = "false"
 
 LLM_CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "llm"
 MAX_OUTPUT_TOKENS = 8000  # LLM call conventions: about 8k prevents truncation
@@ -358,13 +360,27 @@ def macro_node(state: CommitteeState) -> dict[str, MacroReport]:
 
 
 def _abstained_report(state_key: str, snapshot: Snapshot, error: Exception) -> Report:
-    """Return the neutral report an analyst falls back to on failure (no vote cast)."""
+    """Return the report an analyst falls back to on failure.
+
+    Sentiment casts no vote. Technical and macro keep their code-computed
+    numbers (R2) and lose only the narration, so the traded technical score
+    stays the one the backtest uses (story 4).
+    """
     why = {"error": f"abstained: {error}"}
     if state_key == "macro":
         macro = snapshot.macro
         return MacroReport(
             score={}, why=why, abstained=True, regime=macro.regime, flags=macro.flags
         )
+
+    if state_key == "technical":
+        # .items() rather than indexing UNIVERSE: this fallback must never raise.
+        scores = {
+            ticker: indicators.score
+            for ticker, indicators in snapshot.technical.items()
+            if ticker in config.UNIVERSE
+        }
+        return Report(score=scores, why=why, abstained=True)
 
     return Report(score={}, why=why, abstained=True)
 
@@ -393,9 +409,9 @@ def _abstain_on_error(
 def _analyst_signals(state: CommitteeState) -> list[Signal]:
     """Return one Signal per universe ticker each analyst report actually scored.
 
-    An abstained report has an empty `score`, so it casts no vote and the
-    other analyst stands alone (story 9) -- no abstained flag needed on the
-    Signal itself.
+    An abstained sentiment report has an empty `score`, so it casts no vote
+    and the technical score stands alone (story 9); an abstained technical
+    report still carries its code-computed scores (R2).
     """
     as_of = state["snapshot"].taken_at.date().isoformat()
     signals = []
