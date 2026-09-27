@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 # Universe and benchmark (Q1)
@@ -185,3 +186,7 @@ DISCLAIMER = (
     "trading; no real money is used or at risk. Nothing here is investment "
     "advice."
 )
+
+# Shared data files: books.py writes the run log, the app replays it (R7, R9).
+DATA_DIR = Path(__file__).resolve().parent / "data"
+RUN_LOG_PATH = DATA_DIR / "run_log.jsonl"
