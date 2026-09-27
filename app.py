@@ -67,6 +67,9 @@ CHAT_SYSTEM_PROMPT = (
     "can't place or change trades. Keep answers short and plain."
 )
 CHAT_PLACEHOLDER = "Ask about your portfolio, e.g. What's my largest sector exposure?"
+BACKTEST_SETUP_NOTE = (
+    "Run `uv run python backtest.py` (needs FRED_API_KEY) to generate the backtest."
+)
 
 # Cash dividends. REI (reinvestment) pairs with a DIVIDEND row, so counting
 # it too would double the income.
@@ -862,6 +865,68 @@ def forward_test_tab() -> None:
     st.plotly_chart(figure, key="forward_test")
 
 
+def backtest_metric_rows(metrics_by_curve: dict[str, dict[str, float]]) -> list[dict]:
+    """Return one formatted table row per backtest curve (story 48)."""
+    rows = []
+    for curve_name, metrics in metrics_by_curve.items():
+        rows.append(
+            {
+                "Curve": curve_name,
+                "Total return": f"{metrics['total_return']:.1%}",
+                "Annualized return": f"{metrics['annualized_return']:.1%}",
+                "Sharpe": f"{metrics['sharpe']:.2f}",
+                "Max drawdown": f"{metrics['max_drawdown']:.1%}",
+                "Excess vs SPY": f"{metrics['excess_return_vs_spy']:+.1%}",
+            }
+        )
+
+    return rows
+
+
+def backtest_tab() -> None:
+    """Plot the P1 backtest's four curves and metrics from the committed results file (S15, stories 46-48)."""
+    if not config.BACKTEST_RESULTS_PATH.exists():
+        st.info(BACKTEST_SETUP_NOTE)
+        return
+
+    results = json.loads(config.BACKTEST_RESULTS_PATH.read_text())
+    st.caption(
+        "Deterministic, no AI: every Monday the 10 names with a positive "
+        "technical score are held at equal weight (otherwise cash), less 5 bps "
+        "of turnover. The overlay invests 100/75/50% of that by the macro "
+        "regime known before each week, from point-in-time FRED data."
+    )
+    # R11 / Risk #12: say plainly the window was benign, with the real count.
+    st.caption(
+        f"A benign year: SPY closed below its 200-day average on only "
+        f"{results['spy_days_below_sma200']} of {results['window_days']} trading "
+        "days. In a calm year the macro overlay has little to react to, so it can "
+        "look like staying fully invested. FRED's high-yield spread history only "
+        "starts in 2023, so there is no 2020 or 2022 stress test."
+    )
+
+    figure = go.Figure()
+    for curve_name, growth in results["growth"].items():
+        line_style = None
+        if curve_name == config.BENCHMARK:
+            line_style = {"color": "gray", "dash": "dash"}
+
+        figure.add_scatter(
+            x=results["dates"],
+            y=normalized(growth),
+            name=curve_name,
+            mode="lines",
+            line=line_style,
+        )
+    figure.update_layout(
+        yaxis_title="Value (start = 100)",
+        hovermode="x unified",
+        height=420,
+    )
+    st.plotly_chart(figure, key="backtest")
+    st.dataframe(backtest_metric_rows(results["metrics"]), hide_index=True)
+
+
 def dividend_income(activities: list[dict]) -> float:
     """Return the cash dividends paid across the activity rows."""
     income = 0.0
@@ -1023,10 +1088,22 @@ def main() -> None:
     check_password()
     prepare_live_books()
 
-    tab_labels = ["Committee", "Portfolio", "Activity", "Chat", "Forward test"]
-    committee_area, portfolio_area, activity_area, chat_area, forward_test_area = (
-        st.tabs(tab_labels)
-    )
+    tab_labels = [
+        "Committee",
+        "Portfolio",
+        "Activity",
+        "Chat",
+        "Forward test",
+        "Backtest",
+    ]
+    (
+        committee_area,
+        portfolio_area,
+        activity_area,
+        chat_area,
+        forward_test_area,
+        backtest_area,
+    ) = st.tabs(tab_labels)
     with committee_area:
         committee_tab()
     with portfolio_area:
@@ -1037,6 +1114,8 @@ def main() -> None:
         chat_tab()
     with forward_test_area:
         forward_test_tab()
+    with backtest_area:
+        backtest_tab()
 
 
 if __name__ == "__main__":
