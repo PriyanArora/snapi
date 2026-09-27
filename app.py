@@ -82,8 +82,8 @@ CHAT_PLACEHOLDER = "Ask about your portfolio, e.g. What's my largest sector expo
 # Cash dividends. REI (reinvestment) pairs with a DIVIDEND row, so counting
 # it too would double the income.
 DIVIDEND_TYPES = frozenset({"DIVIDEND", "SUBSTITUTE_DIVIDEND"})
-# Trades are hidden by default: the table is for corporate actions and
-# transfers (Q11), and our own orders have their own table.
+# Trades start hidden: Q11's table is dividends, splits, mergers and
+# transfers. The type filter can add them back.
 TRADE_TYPES = frozenset({"BUY", "SELL"})
 
 NEW_YORK = ZoneInfo("America/New_York")
