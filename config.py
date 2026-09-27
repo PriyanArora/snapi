@@ -169,16 +169,39 @@ MACD_MEAN_ABS_LOOKBACK_DAYS = 63
 SMA_FAST = 50
 SMA_SLOW = 200
 
-# LLM model choice (T15). One env var picks Haiku 4.5 (dev) or Sonnet 5 (demo).
+# LLM model choice (T15). One env var picks Haiku 4.5 (dev) or Sonnet 5 (demo)
+# as the default; the Committee page can pick any of MODEL_CHOICES per run.
 SNAPI_MODEL_ENV_VAR = "SNAPI_MODEL"
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 SONNET_DEMO_MODEL = "claude-sonnet-5"
+OPUS_MODEL = "claude-opus-5-5"
+
+# Display label -> model id.
+MODEL_CHOICES = {
+    "Haiku 4.5": DEFAULT_MODEL,
+    "Sonnet 5": SONNET_DEMO_MODEL,
+    "Opus 5.5": OPUS_MODEL,
+}
+
+# What the committee answers when the user asks nothing more specific.
+DEFAULT_QUESTION = (
+    "Given today's market, what should each of my three portfolios buy or sell?"
+)
 
 
 def get_model_name() -> str:
     """Return the LLM model id, from SNAPI_MODEL or the Haiku 4.5 default."""
     # `or`, not a get() default: .env.example's empty SNAPI_MODEL= loads as "".
     return os.environ.get(SNAPI_MODEL_ENV_VAR) or DEFAULT_MODEL
+
+
+def get_model_label(model_name: str) -> str:
+    """Return a model id's display label ("Sonnet 5"), or the id itself when it isn't one of MODEL_CHOICES."""
+    for label, choice_model_name in MODEL_CHOICES.items():
+        if model_name == choice_model_name:
+            return label
+
+    return model_name
 
 
 # Disclaimer (Q13), shown on the gate screen and the closing slide verbatim.
@@ -192,6 +215,9 @@ DISCLAIMER = (
 # collections of the same name when MONGODB_URI is set (Hosting).
 DATA_DIR = Path(__file__).resolve().parent / "data"
 RUN_LOG_PATH = DATA_DIR / "run_log.jsonl"
+# The latest Sonnet run, kept so the UI can fall back to it when a live run
+# fails or is too slow.
+SONNET_RUNS_PATH = DATA_DIR / "sonnet_runs.jsonl"
 
 # P1 backtest output (S15): backtest.py writes it, the Backtest tab reads it.
 BACKTEST_RESULTS_PATH = DATA_DIR / "backtest_results.json"

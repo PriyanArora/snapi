@@ -28,6 +28,7 @@ from committee import (
     SentimentAnswer,
     SentimentView,
     Snapshot,
+    Verdict,
     run_committee,
 )
 from external.broker_models import Order
@@ -113,6 +114,10 @@ PM_ANSWER = PMView(
     drops=[Drop(ticker="XOM", reason="conviction too weak to size")],
 )
 CRITIC_ANSWER = CriticNotes(notes="Concentration risk in a handful of mega-cap names.")
+VERDICT_ANSWER = Verdict(
+    summary="Semis and Big Tech lead; follow the aggressive book.",
+    persona="aggressive",
+)
 
 
 class FakeStructuredModel:
@@ -152,7 +157,7 @@ def use_fake_model(
     """Route committee.ask through a fake model and an isolated, throwaway cache dir."""
 
     def _install(answers: dict[type, object]) -> None:
-        def build_fake_chat_model() -> FakeChatModel:
+        def build_fake_chat_model(model_name: str) -> FakeChatModel:
             return FakeChatModel(answers)
 
         monkeypatch.setattr(committee, "LLM_CACHE_DIR", tmp_path)
@@ -219,6 +224,7 @@ def test_every_persona_respects_its_limits(use_fake_model: Callable) -> None:
             Narration: NARRATION_ANSWER,
             PMView: PM_ANSWER,
             CriticNotes: CRITIC_ANSWER,
+            Verdict: VERDICT_ANSWER,
         }
     )
 
@@ -237,6 +243,7 @@ def test_a_failing_analyst_abstains_and_the_run_completes(
             Narration: NARRATION_ANSWER,
             PMView: PM_ANSWER,
             CriticNotes: CRITIC_ANSWER,
+            Verdict: VERDICT_ANSWER,
         }
     )
 
@@ -245,3 +252,39 @@ def test_a_failing_analyst_abstains_and_the_run_completes(
     assert proposal.sentiment.abstained is True
     assert proposal.technical.abstained is False
     _assert_persona_limits_hold(proposal)
+
+
+@pytest.mark.parametrize(
+    ("verdict_answer", "expected_persona"),
+    [
+        (VERDICT_ANSWER, "aggressive"),
+        (TimeoutError("verdict timed out"), "balanced"),  # degrades like the PM
+    ],
+)
+def test_recommend_follows_the_verdict_persona(
+    use_fake_model: Callable,
+    verdict_answer: object,
+    expected_persona: str,
+) -> None:
+    """The recommended persona is the verdict's pick, and a failing verdict falls back to Balanced."""
+    use_fake_model(
+        {
+            SentimentAnswer: SENTIMENT_ANSWER,
+            Narration: NARRATION_ANSWER,
+            PMView: PM_ANSWER,
+            CriticNotes: CRITIC_ANSWER,
+            Verdict: verdict_answer,
+        }
+    )
+
+    proposal = run_committee(
+        _fixture_snapshot(),
+        question="Should I trim semis?",
+        model_name=config.SONNET_DEMO_MODEL,
+    )
+
+    assert proposal.verdict.persona == expected_persona
+    assert proposal.recommended_persona == expected_persona
+    assert proposal.recommended_persona in proposal.orders
+    assert proposal.question == "Should I trim semis?"
+    assert proposal.model_name == config.SONNET_DEMO_MODEL

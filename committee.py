@@ -2,10 +2,15 @@
 
 One StateGraph, no memory or checkpointer (LangGraph shape): three analysts
 run concurrently, then the Portfolio Manager, then `size` (code only, one
-call per persona through `portfolio.size_persona`), then the critic. Each
+call per persona through `portfolio.size_persona`), then the critic, then
+the verdict (which persona to follow) and `recommend` (code only). Each
 analyst owns its own state key and is wrapped so a failure abstains instead
 of discarding the whole run (story 9) -- a LangGraph superstep is
 transactional, so one failing branch would otherwise cancel the others.
+
+Every agent is shown the committee's question and runs on the model picked
+for the run; both are optional graph inputs, defaulting to
+`config.DEFAULT_QUESTION` and `config.get_model_name()`.
 
 `run_committee(snapshot) -> proposal` is the PRD's entry point (seam 1);
 `app.py` instead streams `build_graph()` in "updates" mode, so each card
@@ -20,7 +25,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import BaseChatModel
@@ -98,8 +103,19 @@ class Critique(BaseModel):
     down_more_than_10pct: dict[str, list[str]]
 
 
+class Verdict(BaseModel):
+    """The final judge's short paragraph and the one persona to follow; also its ask schema."""
+
+    summary: str
+    persona: Literal["conservative", "balanced", "aggressive"]
+
+
 class Proposal(BaseModel):
-    """What Approve executes; also the run-log payload."""
+    """What Approve executes; also the run-log payload.
+
+    The fields after `critique` default so run-log records written before
+    them still parse.
+    """
 
     target_weights: dict[str, dict[str, float]]
     orders: dict[str, list[Order]]
@@ -108,6 +124,10 @@ class Proposal(BaseModel):
     macro: MacroReport | None = None
     pm: PMView | None = None
     critique: Critique | None = None
+    question: str = config.DEFAULT_QUESTION
+    model_name: str | None = None
+    verdict: Verdict | None = None
+    recommended_persona: str | None = None
 
 
 class CommitteeState(TypedDict):
@@ -115,9 +135,13 @@ class CommitteeState(TypedDict):
 
     `target_weights` is not in the PRD's state shape, but `execute` needs
     the approved weights and an `Order` list alone can't rebuild them.
+    `question` and `model_name` are optional inputs (see `_run_question`
+    and `_run_model_name` for their defaults).
     """
 
     snapshot: Snapshot
+    question: NotRequired[str]
+    model_name: NotRequired[str]
     sentiment: Report
     technical: Report
     macro: MacroReport
@@ -125,6 +149,8 @@ class CommitteeState(TypedDict):
     proposals: dict[str, list[Order]]
     target_weights: dict[str, dict[str, float]]
     critique: Critique
+    verdict: Verdict
+    recommended: str
 
 
 # LLM answer schemas: lists of objects, never dict fields. The json_schema
@@ -165,27 +191,31 @@ class CriticNotes(BaseModel):
     notes: str
 
 
-# The five agent prompts, in graph order. The finance teammate owns the
+# The six agent prompts, in graph order. The finance teammate owns the
 # wording; these one-paragraph drafts stay here, in one obvious place.
 SENTIMENT_PROMPT = (
     "You are the Sentiment analyst on an investment committee. For every "
     "ticker you are shown, read its recent headlines (and any Alpha Vantage "
     "sentiment score/label given) and score it from -1 (bearish) to +1 "
     "(bullish), with one plain-English line on why. If a ticker has no "
-    "usable headlines, you may leave it out."
+    "usable headlines, you may leave it out. Keep the committee's question, "
+    "given first, in mind, but score each ticker from its own headlines and "
+    "never add one."
 )
 TECHNICAL_PROMPT = (
     "You are the Technical analyst on an investment committee. You are given "
     "each ticker's already-computed score, RSI 14, MACD histogram and "
     "50/200-day SMA cross. Explain, in one plain-English line per ticker, "
     "what those numbers say about trend and momentum. Never invent a number "
-    "or change the score."
+    "or change the score. Keep the committee's question, given first, in "
+    "mind, but still narrate every ticker and never add one."
 )
 MACRO_PROMPT = (
     "You are the Macro analyst on an investment committee. You are given the "
     "current regime, the flag count and which of the five macro flags are "
     "raised or clear. Explain, in one plain-English line per flag, what it "
-    "means for risk appetite. Never invent a number or change the regime."
+    "means for risk appetite. Never invent a number or change the regime. "
+    "Keep the committee's question, given first, in mind as you explain."
 )
 PM_PROMPT = (
     "You are the Portfolio Manager on an investment committee. You are given "
@@ -194,14 +224,26 @@ PM_PROMPT = (
     "the current regime. Write a short memo on the overall stance. You may "
     "drop a name the book should not hold, with a stated reason: a drop sets "
     "its target to zero and sells any shares held. You can never add a name "
-    "or change a size."
+    "or change a size. Keep the committee's question, given first, in mind "
+    "as you write the memo."
 )
 CRITIC_PROMPT = (
     "You are the devil's-advocate critic on an investment committee. You are "
     "given the PM's memo, the orders sized for each persona, and which "
     "holdings are down more than 10% from cost. Give the strongest "
     "counter-argument to these orders in a short note. There is no "
-    "automatic stop-loss here; a human decides."
+    "automatic stop-loss here; a human decides. Keep the committee's "
+    "question, given first, in mind as you argue."
+)
+VERDICT_PROMPT = (
+    "You are the final judge of an investment committee. You are given each "
+    "analyst's scores and one-line reasons, the macro regime, the PM's memo "
+    "and drops, the orders sized for each persona (conservative, balanced "
+    "and aggressive) and the critic's counter-argument. Write one short "
+    "paragraph on the recommended direction that takes every agent's output "
+    "into account, and pick exactly one persona to follow. You never write "
+    "or change an order. Keep the committee's question, given first, in "
+    "mind and answer it."
 )
 
 
@@ -209,15 +251,17 @@ class AskError(Exception):
     """Raised when the model's structured answer can't be parsed; the node abstains."""
 
 
-def build_chat_model() -> BaseChatModel:
-    """Build the committee's Claude client for the model `config.get_model_name()` picks.
+def build_chat_model(model_name: str) -> BaseChatModel:
+    """Build the committee's Claude client for one model id.
 
-    Effort goes to Sonnet 5 only, because Haiku 4.5 rejects it; temperature,
-    top-p and top-k are never set (LLM call conventions). Seam-1 tests
-    monkeypatch this function to return a fake model.
+    Effort goes to Sonnet 5 and Opus 5.5 only, because Haiku 4.5 rejects it;
+    temperature, top-p and top-k are never set (LLM call conventions).
+    Seam-1 tests monkeypatch this function to return a fake model.
     """
-    model_name = config.get_model_name()
-    if model_name.startswith(config.SONNET_DEMO_MODEL):
+    accepts_effort = model_name.startswith(
+        (config.SONNET_DEMO_MODEL, config.OPUS_MODEL)
+    )
+    if accepts_effort:
         return ChatAnthropic(
             model=model_name, max_tokens=MAX_OUTPUT_TOKENS, reasoning_effort="low"
         )
@@ -226,15 +270,18 @@ def build_chat_model() -> BaseChatModel:
 
 
 def ask[AnswerT: BaseModel](
-    agent: str, system: str, user: str, schema: type[AnswerT]
+    agent: str,
+    system: str,
+    user: str,
+    schema: type[AnswerT],
+    model_name: str,
 ) -> AnswerT:
     """Return the model's structured answer, from the disk prompt cache when this exact prompt ran before.
 
     Identical (agent, model, system, user) hits the cache and costs $0 on
     rerun (story 16). Raises AskError on a parse failure, which the analyst
-    wrapper or the PM/critic node turns into an abstain/degrade.
+    wrapper or the PM/critic/verdict node turns into an abstain/degrade.
     """
-    model_name = config.get_model_name()
     cache = PromptCache(LLM_CACHE_DIR)
     cache_key = prompt_key(agent, model_name, system, user)
 
@@ -242,7 +289,7 @@ def ask[AnswerT: BaseModel](
     if cached is not None:
         return schema.model_validate(cached["parsed"])
 
-    structured_model = build_chat_model().with_structured_output(
+    structured_model = build_chat_model(model_name).with_structured_output(
         schema,
         method="json_schema",
         include_raw=True,
@@ -265,6 +312,28 @@ def ask[AnswerT: BaseModel](
         },
     )
     return answer
+
+
+def _run_question(state: CommitteeState) -> str:
+    """Return the question this run answers, or the default when the caller passed none."""
+    return state.get("question") or config.DEFAULT_QUESTION
+
+
+def _run_model_name(state: CommitteeState) -> str:
+    """Return the model this run uses, or the SNAPI_MODEL/Haiku default when the caller passed none."""
+    return state.get("model_name") or config.get_model_name()
+
+
+def _ask_committee[AnswerT: BaseModel](
+    state: CommitteeState,
+    agent: str,
+    system: str,
+    facts: str,
+    schema: type[AnswerT],
+) -> AnswerT:
+    """Ask one agent on the run's model, with the committee's question above its facts."""
+    user = f"Committee question: {_run_question(state)}\n\n{facts}"
+    return ask(agent, system, user, schema, _run_model_name(state))
 
 
 def _news_prompt(news: dict[str, TickerNews]) -> str:
@@ -291,7 +360,9 @@ def _news_prompt(news: dict[str, TickerNews]) -> str:
 def sentiment_node(state: CommitteeState) -> dict[str, Report]:
     """Sentiment analyst: the LLM scores each ticker's news; scores are clipped to [-1, 1] in code."""
     news = state["snapshot"].news
-    answer = ask("sentiment", SENTIMENT_PROMPT, _news_prompt(news), SentimentAnswer)
+    answer = _ask_committee(
+        state, "sentiment", SENTIMENT_PROMPT, _news_prompt(news), SentimentAnswer
+    )
     tickers_with_headlines = {
         ticker for ticker, ticker_news in news.items() if ticker_news.articles
     }
@@ -326,7 +397,9 @@ def _technical_prompt(technical: dict[str, TechnicalScore]) -> str:
 def technical_node(state: CommitteeState) -> dict[str, Report]:
     """Technical analyst: the score comes from code (R2); the LLM only narrates it."""
     technical = state["snapshot"].technical
-    answer = ask("technical", TECHNICAL_PROMPT, _technical_prompt(technical), Narration)
+    answer = _ask_committee(
+        state, "technical", TECHNICAL_PROMPT, _technical_prompt(technical), Narration
+    )
 
     reasons = {
         note.name: note.why for note in answer.notes if note.name in config.UNIVERSE
@@ -349,7 +422,9 @@ def _macro_prompt(macro: MacroChecklist) -> str:
 def macro_node(state: CommitteeState) -> dict[str, MacroReport]:
     """Macro analyst: the regime and flags come from code (R2); the LLM only narrates them."""
     macro = state["snapshot"].macro
-    answer = ask("macro", MACRO_PROMPT, _macro_prompt(macro), Narration)
+    answer = _ask_committee(
+        state, "macro", MACRO_PROMPT, _macro_prompt(macro), Narration
+    )
 
     reasons = {note.name: note.why for note in answer.notes if note.name in macro.flags}
     return {
@@ -454,7 +529,9 @@ def pm_node(state: CommitteeState) -> dict[str, PMView]:
         _analyst_signals(state), state["snapshot"].fear_greed
     )
     try:
-        answer = ask("pm", PM_PROMPT, _pm_prompt(state, convictions), PMView)
+        answer = _ask_committee(
+            state, "pm", PM_PROMPT, _pm_prompt(state, convictions), PMView
+        )
     except Exception as error:
         logging.exception("PM view unavailable")
         return {"pm": PMView(memo=f"PM unavailable this cycle: {error}", drops=[])}
@@ -529,7 +606,8 @@ def critic_node(state: CommitteeState) -> dict[str, Critique]:
     }
 
     try:
-        answer = ask(
+        answer = _ask_committee(
+            state,
             "critic",
             CRITIC_PROMPT,
             _critic_prompt(state["pm"].memo, state["proposals"], down),
@@ -543,8 +621,57 @@ def critic_node(state: CommitteeState) -> dict[str, Critique]:
     return {"critique": Critique(notes=notes, down_more_than_10pct=down)}
 
 
+def _verdict_prompt(state: CommitteeState) -> str:
+    """Render every agent's output: analyst scores and whys, regime, PM memo and drops, sized orders, critique."""
+    technical = state["technical"]
+    sentiment = state["sentiment"]
+    macro = state["macro"]
+    pm = state["pm"]
+    critique = state["critique"]
+
+    lines = [f"regime: {macro.regime}"]
+    for flag, why in macro.why.items():
+        lines.append(f"macro {flag}: {why}")
+    for ticker in config.UNIVERSE:
+        lines.append(
+            f"{ticker}: technical={technical.score.get(ticker)} "
+            f"sentiment={sentiment.score.get(ticker)} "
+            f"technical_why={technical.why.get(ticker, '')!r} "
+            f"sentiment_why={sentiment.why.get(ticker, '')!r}"
+        )
+    for drop in pm.drops:
+        lines.append(f"PM drops {drop.ticker}: {drop.reason}")
+
+    # The memo, each persona's orders and its >10%-down list, as the critic saw them.
+    lines.append(
+        _critic_prompt(pm.memo, state["proposals"], critique.down_more_than_10pct)
+    )
+    lines.append(f"Critic: {critique.notes}")
+    return "\n".join(lines)
+
+
+def verdict_node(state: CommitteeState) -> dict[str, Verdict]:
+    """Verdict: the final judge's paragraph and one persona to follow; it never writes or changes an order."""
+    try:
+        verdict = _ask_committee(
+            state, "verdict", VERDICT_PROMPT, _verdict_prompt(state), Verdict
+        )
+    except Exception as error:
+        logging.exception("Verdict unavailable")
+        verdict = Verdict(
+            summary=f"Verdict unavailable this cycle: {error}", persona="balanced"
+        )
+
+    return {"verdict": verdict}
+
+
+def recommend_node(state: CommitteeState) -> dict[str, str]:
+    """Recommend the verdict's persona, whose orders `size` already computed (no LLM, no new sizing)."""
+    return {"recommended": state["verdict"].persona}
+
+
 def build_graph() -> CompiledStateGraph:
-    """Return START -> {sentiment, technical, macro} -> pm -> size -> critic -> END (no checkpointer)."""
+    """Return START -> {sentiment, technical, macro} -> pm -> size -> critic -> verdict -> recommend -> END."""
     graph = StateGraph(CommitteeState)
     graph.add_node("sentiment", _abstain_on_error("sentiment", sentiment_node))
     graph.add_node("technical", _abstain_on_error("technical", technical_node))
@@ -552,6 +679,8 @@ def build_graph() -> CompiledStateGraph:
     graph.add_node("pm", pm_node)
     graph.add_node("size", size_node)
     graph.add_node("critic", critic_node)
+    graph.add_node("verdict", verdict_node)
+    graph.add_node("recommend", recommend_node)
 
     for analyst in ANALYSTS:
         graph.add_edge(START, analyst)
@@ -560,7 +689,9 @@ def build_graph() -> CompiledStateGraph:
     graph.add_edge(list(ANALYSTS), "pm")
     graph.add_edge("pm", "size")
     graph.add_edge("size", "critic")
-    graph.add_edge("critic", END)
+    graph.add_edge("critic", "verdict")
+    graph.add_edge("verdict", "recommend")
+    graph.add_edge("recommend", END)
 
     return graph.compile()
 
@@ -575,10 +706,26 @@ def build_proposal(state: CommitteeState) -> Proposal:
         macro=state["macro"],
         pm=state["pm"],
         critique=state["critique"],
+        question=_run_question(state),
+        model_name=_run_model_name(state),
+        verdict=state["verdict"],
+        recommended_persona=state["recommended"],
     )
 
 
-def run_committee(snapshot: Snapshot) -> Proposal:
-    """Run one committee cycle for all three personas and return the proposal Approve will execute."""
-    final_state = build_graph().invoke({"snapshot": snapshot})
+def run_committee(
+    snapshot: Snapshot,
+    question: str = config.DEFAULT_QUESTION,
+    model_name: str | None = None,
+) -> Proposal:
+    """Run one committee cycle for all three personas and return the proposal Approve will execute.
+
+    `model_name` None means the SNAPI_MODEL/Haiku default.
+    """
+    graph_input = {
+        "snapshot": snapshot,
+        "question": question,
+        "model_name": model_name or config.get_model_name(),
+    }
+    final_state = build_graph().invoke(graph_input)
     return build_proposal(final_state)
