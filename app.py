@@ -20,7 +20,8 @@ import hmac
 import json
 import logging
 import os
-from datetime import datetime
+import uuid
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -203,6 +204,9 @@ CHAT_SYSTEM_PROMPT = (
     "can't place or change trades. Keep answers short and plain."
 )
 CHAT_PLACEHOLDER = "Ask about your portfolio, e.g. What's my largest sector exposure?"
+# A saved chat's title is its first question, cut to fit the Recent chats list.
+CHAT_TITLE_MAX_CHARS = 60
+CHAT_MODEL_SELECT_WIDTH = 180
 UNIVERSE_CHANGED_NOTE = (
     "The stock universe changed. Press Reset books on the Portfolio page to "
     "re-seed the books."
@@ -1505,8 +1509,8 @@ def is_chat_configured() -> bool:
     )
 
 
-def portfolio_chat_model() -> Runnable:
-    """Return Claude wired to SnapTrade's hosted MCP with the hand-minted OAuth token (S13, R6).
+def portfolio_chat_model(model_name: str) -> Runnable:
+    """Return the chosen Claude model wired to SnapTrade's hosted MCP with the hand-minted OAuth token (S13, R6).
 
     langchain-anthropic adds the mcp-client beta header itself once
     `mcp_servers` is set. The Claude API's MCP connector isn't ZDR-eligible,
@@ -1515,7 +1519,7 @@ def portfolio_chat_model() -> Runnable:
     from langchain_anthropic import ChatAnthropic
 
     model = ChatAnthropic(
-        model=config.get_model_name(),
+        model=model_name,
         max_tokens=CHAT_MAX_TOKENS,
         mcp_servers=[
             {
@@ -1538,41 +1542,138 @@ def render_chat_turns(turns: list[dict]) -> None:
             st.markdown(escape_markdown_math(turn["content"]))
 
 
-def ask_portfolio_chat(history: list[dict], question: str) -> None:
-    """Answer one question with the whole conversation so far, then keep both turns in the history.
+def new_chat() -> dict:
+    """Return an empty conversation with its own id; it is saved once its first question is answered."""
+    return {"chat_id": str(uuid.uuid4()), "turns": []}
+
+
+def chat_title(question: str) -> str:
+    """Return the first question on one line, cut to CHAT_TITLE_MAX_CHARS, as the chat's title."""
+    title = " ".join(question.split())
+    if len(title) <= CHAT_TITLE_MAX_CHARS:
+        return title
+
+    return title[: CHAT_TITLE_MAX_CHARS - 1].rstrip() + "…"
+
+
+def recent_chat_label(chat: dict) -> str:
+    """Return a saved chat's Recent chats entry: title · model · date."""
+    model_label = config.get_model_label(chat["model_name"])
+    updated_on = format_long_date(chat["updated_at"])
+    return f"{chat['title']} · {model_label} · {updated_on}"
+
+
+def ask_portfolio_chat(chat: dict, question: str, model_name: str) -> None:
+    """Answer one question with the whole conversation so far, then keep both turns and save the chat.
 
     The MCP round trips run on Anthropic's side inside the one call; `.text`
-    keeps only the answer's text blocks.
+    keeps only the answer's text blocks. A failed call keeps and saves nothing.
     """
+    import books
+
     question_turn = {"role": "user", "content": question}
     messages = [("system", CHAT_SYSTEM_PROMPT)]
-    for turn in [*history, question_turn]:
+    for turn in [*chat["turns"], question_turn]:
         messages.append((turn["role"], turn["content"]))
 
     try:
         with st.spinner("Reading your SnapTrade accounts..."):
-            reply = portfolio_chat_model().invoke(messages)
+            reply = portfolio_chat_model(model_name).invoke(messages)
     except Exception as error:
         # An expired token lands here (Risk #15): mint a new one (R6).
         show_live_error("The portfolio chat", error)
         return
 
-    history.append(question_turn)
-    history.append({"role": "assistant", "content": str(reply.text)})
+    answered_at = datetime.now(UTC).isoformat()
+    if not chat["turns"]:
+        chat["title"] = chat_title(question)
+        chat["created_at"] = answered_at
+    chat["turns"].append(question_turn)
+    chat["turns"].append(
+        {"role": "assistant", "content": str(reply.text), "model_name": model_name}
+    )
+    chat["model_name"] = model_name
+    chat["updated_at"] = answered_at
+
+    try:
+        books.save_chat(chat)
+    except Exception as error:
+        # st.rerun would wipe the error, so show the new answer beside it.
+        render_chat_turns(chat["turns"][-2:])
+        show_live_error("Saving the chat", error)
+        return
+
     st.rerun()
 
 
+def read_recent_chats() -> list[dict]:
+    """Return the saved chats for Recent chats; a failed read shows its error and lists none."""
+    import books
+
+    try:
+        return books.recent_chats()
+    except Exception as error:
+        show_live_error("Reading your recent chats", error)
+        return []
+
+
+def render_chat_controls(chat: dict) -> str:
+    """Draw Model, Recent chats and New chat, switch the open chat when asked, and return the chosen model id."""
+    saved_chats_by_id = {}
+    chat_choices = []
+    for saved_chat in read_recent_chats():
+        saved_chats_by_id[saved_chat["chat_id"]] = saved_chat
+        chat_choices.append(
+            ui.Choice(value=saved_chat["chat_id"], label=recent_chat_label(saved_chat))
+        )
+    # The open chat is the select's default, so the select follows New chat
+    # and a chat's first save.
+    open_chat_id = chat["chat_id"] if chat["chat_id"] in saved_chats_by_id else None
+
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        model_label = ui.select(
+            "Model",
+            list(config.MODEL_CHOICES),
+            value=config.get_model_label(config.get_model_name()),
+            key="chat_model",
+            width=CHAT_MODEL_SELECT_WIDTH,
+        )
+        picked_chat_id = ui.select(
+            "Recent chats",
+            chat_choices,
+            value=open_chat_id,
+            index=None,
+            placeholder="Open a recent chat",
+            key="recent_chats",
+        )
+        is_new_chat_pressed = ui.button("New chat", key="new_chat", variant="outline")
+
+    if is_new_chat_pressed:
+        st.session_state["chat"] = new_chat()
+        st.rerun()
+
+    if picked_chat_id is not None and picked_chat_id != chat["chat_id"]:
+        st.session_state["chat"] = saved_chats_by_id[picked_chat_id]
+        st.rerun()
+
+    return config.MODEL_CHOICES[model_label]
+
+
 def chat_tab() -> None:
-    """Answer plain-English portfolio questions through SnapTrade's hosted MCP, live only (S13, stories 41-42)."""
+    """Answer plain-English portfolio questions through SnapTrade's hosted MCP, live only (S13, stories 41-42).
+
+    Each answered chat is saved, and Recent chats reopens one to carry it on.
+    """
     if not is_chat_configured():
         st.info(CHAT_SETUP_NOTE)
         return
 
-    history = st.session_state.setdefault("chat_history", [])
-    render_chat_turns(history)
+    chat = st.session_state.setdefault("chat", new_chat())
+    model_name = render_chat_controls(chat)
+    render_chat_turns(chat["turns"])
     question = st.chat_input(CHAT_PLACEHOLDER)
     if question:
-        ask_portfolio_chat(history, question)
+        ask_portfolio_chat(chat, question, model_name)
 
 
 def main() -> None:
