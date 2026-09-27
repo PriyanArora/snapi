@@ -307,6 +307,7 @@ def take_snapshot() -> Snapshot:
         fear_greed=feeds.fetch_fear_and_greed(),
         macro=signals.compute_macro_checklist(feeds.fetch_macro_series()),
         books=books_by_persona,
+        fundamentals=feeds.fetch_fundamentals(),
     )
 
 

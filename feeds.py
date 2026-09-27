@@ -1,25 +1,28 @@
-"""Feeds: network calls for news sentiment, market mood and macro data.
+"""Feeds: network calls for news sentiment, market mood, fundamentals and macro data.
 
 Every function here returns plain data, with no LLM calls (S1; Tooling Stack
 rows: News sentiment, Sentiment fallback, Market mood, Macro). Alpha Vantage
 NEWS_SENTIMENT answers are cached to disk once a day, since only 25 of its
-free calls are available and a ticker-per-call universe fetch spends 10 of
-them (Risk #16); the CNN Fear & Greed reading is cached the same way so a
-demo cycle never depends on it being reachable live.
+free calls are available and a ticker-per-call universe fetch spends 11 of
+them (Risk #16); the CNN Fear & Greed reading and yfinance's fundamentals
+are cached the same way so a demo cycle never depends on them being
+reachable live.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
 from typing import Literal
 from urllib.error import URLError
 
 import requests
+import yfinance as yf
 from fredapi import Fred
 
 from config import UNIVERSE
@@ -77,6 +80,14 @@ class TickerNews:
 
     source: NewsSource
     articles: list[NewsArticle]
+
+
+@dataclass(frozen=True)
+class Fundamentals:
+    """A stock's forward P/E and debt-to-equity ratio; None where yfinance has no number."""
+
+    forward_pe: float | None
+    debt_to_equity: float | None
 
 
 def _cache_path(name: str) -> Path:
@@ -273,6 +284,67 @@ def fetch_fear_and_greed() -> float | None:
 
     _write_cache("fear_and_greed", {"score": score})
     return score
+
+
+def _number_or_none(value: object) -> float | None:
+    """Return `value` as a float when yfinance gave a number, else None (a gap or a string)."""
+    if isinstance(value, int | float):
+        return float(value)
+
+    return None
+
+
+def _fetch_ticker_fundamentals(ticker: str) -> Fundamentals:
+    """Return `ticker`'s forward P/E and debt-to-equity ratio from yfinance, cached daily.
+
+    Raises whatever yfinance raises; `fetch_fundamentals` turns that into None fields.
+    """
+    cache_name = f"fundamentals-{ticker}"
+    cached_payload = _read_cache(cache_name)
+    if cached_payload is not None:
+        return Fundamentals(**cached_payload)
+
+    info = yf.Ticker(ticker).info
+
+    # yfinance reports debt-to-equity in percent: 150 means debt is 1.5x equity.
+    debt_to_equity = _number_or_none(info.get("debtToEquity"))
+    if debt_to_equity is not None:
+        debt_to_equity /= 100
+
+    fundamentals = Fundamentals(
+        forward_pe=_number_or_none(info.get("forwardPE")),
+        debt_to_equity=debt_to_equity,
+    )
+
+    # Neither number usually means Yahoo sent a stub page; caching it would
+    # skip this stock's tilt for the rest of the day.
+    if fundamentals.forward_pe is None and fundamentals.debt_to_equity is None:
+        logging.warning("yfinance returned no fundamentals for %s", ticker)
+        return fundamentals
+
+    _write_cache(cache_name, asdict(fundamentals))
+    return fundamentals
+
+
+def fetch_fundamentals(tickers: tuple[str, ...] = UNIVERSE) -> dict[str, Fundamentals]:
+    """Return each ticker's forward P/E and debt-to-equity ratio for the fundamentals tilt.
+
+    A ticker whose read fails gets None fields, which skips its tilt, the
+    same "feed unavailable -> tilt skipped" rule as Fear & Greed (Q6).
+    """
+    fundamentals_by_ticker = {}
+    for ticker in tickers:
+        try:
+            fundamentals_by_ticker[ticker] = _fetch_ticker_fundamentals(ticker)
+        except Exception:
+            # yfinance scrapes Yahoo and raises many error types (rate limits,
+            # HTTP, parsing); one bad read must not sink the cycle.
+            logging.exception("Fundamentals unavailable for %s", ticker)
+            fundamentals_by_ticker[ticker] = Fundamentals(
+                forward_pe=None, debt_to_equity=None
+            )
+
+    return fundamentals_by_ticker
 
 
 def fetch_macro_series() -> dict[str, float]:

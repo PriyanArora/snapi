@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TypedDict
@@ -33,8 +33,14 @@ import config
 from external.broker_models import Order
 from external.cache import PromptCache, prompt_key
 from external.models import Signal
-from feeds import TickerNews
-from portfolio import Book, blend_convictions, get_fear_greed_tilt, size_persona
+from feeds import Fundamentals, TickerNews
+from portfolio import (
+    Book,
+    blend_convictions,
+    get_fear_greed_tilt,
+    get_fundamentals_tilt,
+    size_persona,
+)
 from signals import MacroChecklist, TechnicalScore
 
 # R12: tracing off, pinned here rather than left to the shell default, since
@@ -60,6 +66,8 @@ class Snapshot:
     fear_greed: float | None
     macro: MacroChecklist
     books: dict[str, Book]
+    # Empty skips the per-stock fundamentals tilt, like a missing feed.
+    fundamentals: dict[str, Fundamentals] = field(default_factory=dict)
 
 
 class Report(BaseModel):
@@ -437,9 +445,13 @@ def _pm_prompt(state: CommitteeState, convictions: dict[str, float]) -> str:
         f"fear_greed: {fear_greed} (tilt {tilt:+.2f})",
     ]
     for ticker in config.UNIVERSE:
+        fundamentals_tilt = get_fundamentals_tilt(
+            ticker, state["snapshot"].fundamentals
+        )
         lines.append(
             f"{ticker}: technical={technical.score.get(ticker)} "
             f"sentiment={sentiment.score.get(ticker)} "
+            f"fundamentals_tilt={fundamentals_tilt:+.2f} "
             f"conviction={convictions.get(ticker, 0.0):.3f} "
             f"technical_why={technical.why.get(ticker, '')!r} "
             f"sentiment_why={sentiment.why.get(ticker, '')!r}"
@@ -451,7 +463,9 @@ def _pm_prompt(state: CommitteeState, convictions: dict[str, float]) -> str:
 def pm_node(state: CommitteeState) -> dict[str, PMView]:
     """Portfolio Manager: a memo plus drop-only vetoes (R1); conviction is F12, in code."""
     convictions = blend_convictions(
-        _analyst_signals(state), state["snapshot"].fear_greed
+        _analyst_signals(state),
+        state["snapshot"].fear_greed,
+        state["snapshot"].fundamentals,
     )
     try:
         answer = ask("pm", PM_PROMPT, _pm_prompt(state, convictions), PMView)
@@ -479,6 +493,7 @@ def size_node(state: CommitteeState) -> dict:
             snapshot.books[persona_key],
             snapshot.marks,
             snapshot.fear_greed,
+            snapshot.fundamentals,
             dropped_tickers,
         )
         proposals[persona_key] = result.orders

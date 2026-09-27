@@ -12,11 +12,11 @@ Behind the scenes, a **swarm of six Claude agents** does the thinking. Three ana
 | Models | **Claude Haiku 4.5** for development, **Claude Sonnet 5** for the live demo | One env var (`SNAPI_MODEL`) switches between them, and a disk prompt cache makes repeat runs free |
 | Brokerage | **SnapTrade Python SDK v13**, **Alpaca Paper**, **SnapTrade Sandbox** | Real paper orders, live positions and balances, plus dividends, splits and order history |
 | Chat | **SnapTrade hosted MCP** (read-only) | Portfolio Q&A that can never place a trade |
-| Market data | **yfinance**, **Alpha Vantage**, **CNN Fear and Greed**, **FRED / ALFRED**, **stockstats** | Prices, news sentiment, market mood, macro series and indicators |
+| Market data | **yfinance**, **Alpha Vantage**, **CNN Fear and Greed**, **FRED / ALFRED**, **stockstats** | Prices, fundamentals, news sentiment, market mood, macro series and indicators |
 | App and storage | **Streamlit**, **Plotly**, **MongoDB Atlas** | A password-protected dashboard. Progress is saved to MongoDB when `MONGODB_URI` is set, and to local files otherwise |
 | Hosting | **Streamlit Community Cloud** | The same live app as localhost, with the same settings |
 | Tooling | **Python 3.12**, **uv**, **ruff**, **pytest**, **GitHub Actions** | Package management, lint and tests on every push |
-| Finance | Conviction blend, macro regime, sector caps, backtest | **0.6 x Technical + 0.4 x Sentiment** conviction. The macro regime sets how much is invested (100%, 75% or 50% of each persona's ceiling). A Fear and Greed contrarian tilt. Sector caps with pro-rata trims and ETF refills. A **1-year weekly backtest against SPY** with 5 bps costs and point-in-time macro data. A **forward test** tracking NAV against SPY. The Critic flags any position down more than 10% |
+| Finance | Conviction blend, macro regime, sector caps, backtest | **0.6 x Technical + 0.4 x Sentiment** conviction. The macro regime sets how much is invested (100%, 75% or 50% of each persona's ceiling). A Fear and Greed contrarian tilt, and a per-stock tilt against a forward P/E stretched for its sector or heavy debt. Sector caps with pro-rata trims and ETF refills. A **1-year weekly backtest against SPY** with 5 bps costs and point-in-time macro data. A **forward test** tracking NAV against SPY. The Critic flags any position down more than 10% |
 
 ## Architecture
 

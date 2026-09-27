@@ -1170,7 +1170,9 @@ def backtest_tab() -> None:
         "score at the previous close are held at equal weight, at most "
         f"{max_name_weight:.0%} each (Balanced's per-name max), with the rest in "
         "cash, less 5 bps of turnover. The overlay invests 100/75/50% of that by "
-        "the macro regime known before each week, from point-in-time FRED data."
+        "the macro regime known before each week, from point-in-time FRED data. "
+        "The fundamentals tilt is left out: there is no free point-in-time "
+        "forward P/E history."
     )
     # R11 / Risk #12: say plainly the window was benign, with the real count.
     st.caption(

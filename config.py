@@ -161,6 +161,26 @@ FEAR_GREED_LOW = 25
 FEAR_GREED_HIGH = 75
 FEAR_GREED_TILT = 0.10
 
+# Fundamentals tilt (the finance teammate, Phase11): a per-stock nudge in
+# the same deterministic style as the Fear & Greed tilt, with no LLM call.
+# What counts as an expensive forward P/E depends on the sector.
+FORWARD_PE_LIMIT_BY_SECTOR = {
+    "Technology": 35.0,
+    "Communication": 25.0,
+    "Consumer": 30.0,
+    "Staples": 25.0,
+    "Financials": 15.0,
+    "Energy": 15.0,
+    "Healthcare": 22.0,
+}
+FORWARD_PE_TILT = 0.05  # forward P/E above its sector's limit
+FORWARD_PE_STRETCHED_MULTIPLE = 1.5
+FORWARD_PE_STRETCHED_TILT = 0.10  # forward P/E above 1.5x the limit
+DEBT_TO_EQUITY_LIMIT = 2.0  # a ratio: 2.0 means debt is twice equity
+DEBT_TO_EQUITY_TILT = 0.05  # taken on top of the forward P/E tilt
+# Bank leverage is structural, so the debt check skips this sector.
+DEBT_TO_EQUITY_SKIPPED_SECTOR = "Financials"
+
 # Technical score inputs (F14, Q7).
 RSI_PERIOD = 14
 RSI_MIDPOINT = 50
