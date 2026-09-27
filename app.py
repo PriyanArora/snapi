@@ -167,7 +167,7 @@ def check_password() -> None:
     if not read_app_password():
         st.error(
             f"No {APP_PASSWORD_SECRET} found. Add it to .streamlit/secrets.toml "
-            "(or the Cloud app's Secrets) and reload."
+            "and reload."
         )
         st.stop()
 
