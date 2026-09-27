@@ -68,15 +68,10 @@ def _clip_to_unit_range(sub_score: float) -> float:
 
 
 def compute_technical_score(ticker: str, as_of: date | None = None) -> TechnicalScore:
-    """Return `ticker`'s technical score, plus the raw RSI/MACD/SMA behind it.
+    """Return `ticker`'s technical score in [-1, 1] as of `as_of` (inclusive), plus the raw RSI/MACD/SMA behind it.
 
-    The score is the average of three sub-scores, each clipped to [-1, 1] (F14, Q7):
-    - RSI 14: (50 - RSI) / 20
-    - MACD 12/26/9 histogram, divided by its own 63-day mean absolute value
-    - 50/200-day SMA cross: +1 if the 50-day is above the 200-day, else -1
-
-    Reads price history up to `as_of` (inclusive) so the P1 backtest can call
-    this at any historical date, not just the latest one.
+    The score averages three sub-scores clipped to [-1, 1] (F14, Q7): RSI,
+    MACD histogram over its 63-day mean absolute value, and the 50/200 cross.
     """
     closes = close_history(ticker, as_of)
     frame = _stock_frame(closes)
@@ -113,13 +108,10 @@ def compute_technical_score(ticker: str, as_of: date | None = None) -> Technical
 def compute_macro_checklist(
     macro_series: dict[str, float], as_of: date | None = None
 ) -> MacroChecklist:
-    """Return the 5-flag macro checklist (F13, Q5) and the regime it implies.
+    """Return the 5-flag macro checklist (F13, Q5) and its regime: 0-1 flags risk-on, 2-3 neutral, 4-5 risk-off.
 
-    `macro_series` is FRED's latest T10Y3M/SAHMREALTIME/BAMLH0A0HYM2/VIXCLS
-    values (feeds.fetch_macro_series). The fifth flag, SPY against its
-    200-day SMA, is read from the committed price snapshot instead, as of
-    the same date. Flag count maps to regime: 0-1 risk_on, 2-3 neutral, 4-5
-    risk_off. The UI shows these derived flags only, never the raw series.
+    The four FRED values come in `macro_series`; SPY against its 200-day SMA
+    is read from the price snapshot as of `as_of`.
     """
     spy_closes = close_history(BENCHMARK, as_of)
     spy_frame = _stock_frame(spy_closes)
