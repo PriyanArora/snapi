@@ -61,6 +61,17 @@ def compute_book_equity(book: Book, marks: dict[str, float]) -> float:
     return book.cash + positions_value
 
 
+def tickers_outside_universe(book: Book) -> list[str]:
+    """Return the held tickers that are neither a universe stock nor a sector ETF, sorted.
+
+    A universe change leaves them in a book until Reset books re-seeds it;
+    they have no price mark or sector, so nothing can value or size them.
+    """
+    return sorted(
+        ticker for ticker in book.shares if ticker not in config.SECTOR_BY_TICKER
+    )
+
+
 def weights_by_ticker(book: Book, marks: dict[str, float]) -> dict[str, float]:
     """Return each held ticker's weight, as a fraction of the book's equity."""
     equity = compute_book_equity(book, marks)

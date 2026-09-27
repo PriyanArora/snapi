@@ -36,7 +36,7 @@ from committee import Proposal, Snapshot
 from config import BENCHMARK, DATA_DIR, PERSONAS, RUN_LOG_PATH, UNIVERSE, Regime
 from external.broker_models import Fill, Order
 from external.sim import SimBroker
-from portfolio import Book, compute_book_equity
+from portfolio import Book, compute_book_equity, tickers_outside_universe
 
 FillTag = Literal["committee", "rebalance", "seed"]
 
@@ -292,8 +292,21 @@ def take_snapshot() -> Snapshot:
     holdings are never mixed in (S16).
     """
     books_by_persona = {}
-    for persona_key in PERSONAS:
-        books_by_persona[persona_key] = current_book(persona_key)
+    for persona_key, persona in PERSONAS.items():
+        book = current_book(persona_key)
+
+        # Names with no mark or sector would crash sizing, and leaving them
+        # out would log a false NAV into the forward test.
+        stale_tickers = tickers_outside_universe(book)
+        if stale_tickers:
+            raise ValueError(
+                f"{persona.display_name}'s book still holds "
+                f"{', '.join(stale_tickers)} from before the stock universe "
+                "changed. Press Reset books on the Portfolio page to re-seed "
+                "the books."
+            )
+
+        books_by_persona[persona_key] = book
 
     technical_scores = {}
     for ticker in UNIVERSE:

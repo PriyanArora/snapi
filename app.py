@@ -203,6 +203,10 @@ CHAT_SYSTEM_PROMPT = (
     "can't place or change trades. Keep answers short and plain."
 )
 CHAT_PLACEHOLDER = "Ask about your portfolio, e.g. What's my largest sector exposure?"
+UNIVERSE_CHANGED_NOTE = (
+    "The stock universe changed. Press Reset books on the Portfolio page to "
+    "re-seed the books."
+)
 BACKTEST_SETUP_NOTE = (
     "Run `uv run python backtest.py` (needs FRED_API_KEY) to generate the backtest."
 )
@@ -402,9 +406,31 @@ def seed_opening_books() -> None:
         show_live_error("Seeding the opening books", error)
 
 
+def warn_if_universe_changed() -> None:
+    """Warn once when a simulator book still holds tickers the stock universe no longer covers."""
+    import books
+    import portfolio
+
+    for persona_key, persona in config.PERSONAS.items():
+        # Reset books re-seeds only the simulator books.
+        if persona.account != "simulator":
+            continue
+
+        try:
+            book = books.load_book(persona_key)
+        except Exception as error:
+            show_live_error(f"Reading {persona.display_name}'s book", error)
+            return
+
+        if portfolio.tickers_outside_universe(book):
+            st.warning(UNIVERSE_CHANGED_NOTE)
+            return
+
+
 def prepare_live_books() -> None:
-    """Seed the simulator personas' opening books once (S16) and check SnapTrade can trade (Balanced step 2)."""
+    """Seed the simulator personas' opening books once (S16), flag stale books and check SnapTrade can trade (Balanced step 2)."""
     seed_opening_books()
+    warn_if_universe_changed()
 
     for persona_key, persona in config.PERSONAS.items():
         try:
@@ -1077,6 +1103,15 @@ def portfolio_tab() -> None:
             book = books.current_book(persona_key)
         except Exception as error:
             show_live_error(f"Reading {persona.display_name}'s book", error)
+            continue
+
+        # Tickers from an older universe have no mark to value them by.
+        stale_tickers = portfolio.tickers_outside_universe(book)
+        if stale_tickers:
+            st.caption(
+                f"Holds {', '.join(stale_tickers)} from the old stock universe; "
+                "Reset books below re-seeds it."
+            )
             continue
 
         weights_by_sector = portfolio.sector_weights(book, marks)
