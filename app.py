@@ -211,6 +211,7 @@ CHAT_SYSTEM_PROMPT = (
     "can't place or change trades. Keep answers short and plain."
 )
 CHAT_PLACEHOLDER = "Ask about your portfolio, e.g. What's my largest sector exposure?"
+SUGGESTED_CHAT_QUESTION = "What's my largest sector exposure across my accounts?"
 # A saved chat's title is its first question, cut to fit the Recent chats list.
 CHAT_TITLE_MAX_CHARS = 60
 CHAT_MODEL_SELECT_WIDTH = 180
@@ -2140,6 +2141,12 @@ def chat_tab() -> None:
     model_name = render_chat_controls(chat)
     render_chat_turns(chat["turns"])
     question = st.chat_input(CHAT_PLACEHOLDER)
+    if not chat["turns"]:
+        # One ready question, so a first chat needs no typing.
+        if ui.button(
+            SUGGESTED_CHAT_QUESTION, key="suggested_question", variant="outline"
+        ):
+            question = SUGGESTED_CHAT_QUESTION
     if question:
         ask_portfolio_chat(chat, question, model_name)
 
