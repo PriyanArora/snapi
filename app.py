@@ -76,6 +76,11 @@ def read_jsonl(path: Path) -> list[dict]:
     return records
 
 
+def display_name(persona_key: str) -> str:
+    """Return the persona's display name, for selector labels and notes."""
+    return config.PERSONAS[persona_key].display_name
+
+
 def is_cloud_mode() -> bool:
     """Return True without an Anthropic key: the public replay, or a laptop before its keys exist (S9)."""
     return not os.environ.get(ANTHROPIC_KEY_ENV_VAR)
@@ -120,7 +125,7 @@ def check_password() -> None:
     if st.session_state.get("password_ok"):
         return
 
-    if read_app_password() is None:
+    if not read_app_password():
         st.error(
             f"No {APP_PASSWORD_SECRET} found. Add it to .streamlit/secrets.toml "
             "(or the Cloud app's Secrets) and reload."
@@ -223,8 +228,7 @@ def render_critique(critique: dict) -> None:
 
     lines = ["Down more than 10% from cost:"]
     for persona_key, tickers in critique["down_more_than_10pct"].items():
-        display_name = config.PERSONAS[persona_key].display_name
-        lines.append(f"- {display_name}: {', '.join(tickers) or 'none'}")
+        lines.append(f"- {display_name(persona_key)}: {', '.join(tickers) or 'none'}")
 
     st.markdown("\n".join(lines))
 
@@ -326,18 +330,18 @@ def execute_for_persona(proposal: Proposal, persona_key: str, tag: str) -> str |
     """Execute one persona's leg of an approved proposal; return why it didn't run, or None when it did."""
     import execute
 
-    display_name = config.PERSONAS[persona_key].display_name
+    persona_name = display_name(persona_key)
     try:
         blocker = find_trade_blocker(persona_key)
         if blocker is not None:
-            return f"{display_name} skipped: {blocker}"
+            return f"{persona_name} skipped: {blocker}"
 
         execute.execute(proposal, persona_key, tag=tag)
     except execute.ExecutionLockedError as error:
         return str(error)
     except Exception as error:
-        logger.error("%s execution failed", display_name, exc_info=error)
-        return f"{display_name} failed ({type(error).__name__}): {error}"
+        logger.error("%s execution failed", persona_name, exc_info=error)
+        return f"{persona_name} failed ({type(error).__name__}): {error}"
 
     return None
 
@@ -357,9 +361,16 @@ def execute_personas(proposal: Proposal, persona_keys: list[str], tag: str) -> d
 
 
 def render_approval_record(record: dict) -> None:
-    """Show one executed batch: SnapTrade's acknowledgements for Balanced, simulator fills for the others."""
+    """Show one executed batch: SnapTrade's acknowledgements for Balanced, simulator fills for the others.
+
+    A batch whose first SnapTrade order failed has neither; its failure
+    note is shown above it.
+    """
     if record["acks"]:
-        st.success("SnapTrade acknowledged: queued for Monday's 09:30 ET open.")
+        st.success(
+            "Sent through SnapTrade to Alpaca Paper: queued for Monday's "
+            "09:30 ET open. Each order's acknowledgement is below."
+        )
         ack_rows = []
         for ack in record["acks"]:
             ack_rows.append(
@@ -372,10 +383,10 @@ def render_approval_record(record: dict) -> None:
                 }
             )
         st.dataframe(ack_rows, hide_index=True)
-        return
 
-    st.success(f"{len(record['fills'])} simulator fills at the snapshot mark.")
-    render_orders(record["fills"])
+    if record["fills"]:
+        st.success(f"{len(record['fills'])} simulator fills at the snapshot mark.")
+        render_orders(record["fills"])
 
 
 def render_execution(persona_key: str, outcome: dict) -> None:
@@ -484,11 +495,6 @@ def committee_tab() -> None:
             render_execution(persona_key, approval)
 
 
-def display_name(persona_key: str) -> str:
-    """Return the persona's display name, for selector labels."""
-    return config.PERSONAS[persona_key].display_name
-
-
 def book_equity(book: dict, marks: dict[str, float]) -> float:
     """Return a JSON-shaped book's value: cash plus every position at its mark."""
     positions_value = 0.0
@@ -509,7 +515,7 @@ def holdings_rows(book: dict, marks: dict[str, float]) -> list[dict]:
         rows.append(
             {
                 "Ticker": ticker,
-                "Sector": config.SECTOR_BY_TICKER[ticker],
+                "Sector": config.SECTOR_BY_TICKER.get(ticker, "none"),
                 "Shares": shares,
                 "Price": round(marks[ticker], 2),
                 "Value": round(value, 2),
