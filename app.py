@@ -4,8 +4,8 @@ Heavy modules (books, committee, execute, brokerage and everything they pull
 in: langgraph, langchain, snaptrade, external/) are imported inside the live
 functions that need them, not at the top. The PRD asks for lazy imports to
 keep start-up fast; that overrides the usual imports-at-the-top rule.
-Renderers take plain JSON-shaped dicts, so a run logged to
-`data/run_log.jsonl` and a run made in this session draw the same way.
+Renderers take plain JSON-shaped dicts: the run kept in the session and
+the approval records read back from `data/run_log.jsonl` draw the same way.
 """
 
 from __future__ import annotations
