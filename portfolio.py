@@ -17,9 +17,6 @@ import config
 from external.broker_models import Order, Position
 from external.execution import build_orders
 
-# build_orders floors weight*equity/mark to whole shares; a target that
-# should equal the current holding can land a float hair under it, so
-# nudge equity up before flooring rather than after (finding: blocking).
 SHARE_ROUNDING_TOLERANCE = 1e-9
 
 

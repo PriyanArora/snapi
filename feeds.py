@@ -39,6 +39,10 @@ FEAR_AND_GREED_HEADERS = {
     "Referer": "https://www.cnn.com/markets/fear-and-greed",
 }
 
+# Any of these keys in an Alpha Vantage response means it rejected the request
+# (rate limit note, informational message or hard error) rather than answering it.
+ALPHA_VANTAGE_REJECTION_KEYS = ("Note", "Information", "Error Message")
+
 REQUEST_TIMEOUT_SECONDS = 10
 
 # The free tier also caps burst rate at 1 request/second (Risk #16); this is
@@ -167,7 +171,8 @@ def fetch_alpha_vantage_news(ticker: str) -> TickerNews:
             f"Alpha Vantage request failed for {ticker!r}: {error}"
         ) from error
 
-    if "Note" in payload or "Information" in payload or "Error Message" in payload:
+    is_rejected = any(key in payload for key in ALPHA_VANTAGE_REJECTION_KEYS)
+    if is_rejected:
         raise FeedUnavailableError(
             f"Alpha Vantage rejected the request for {ticker!r}: {payload}"
         )
