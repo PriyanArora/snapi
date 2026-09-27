@@ -3,8 +3,9 @@
 Setup: a fixed committed snapshot fixture and a fake chat model returning
 canned structured outputs. Checks the outcomes a user would notice at this
 seam: every persona's sector cap, per-name max and cash buffer hold on the
-book the proposed orders actually produce, and a raising analyst abstains
-without sinking the run.
+book the proposed orders actually produce, a raising analyst abstains
+without sinking the run, the verdict's persona is the one recommended, and
+a saved Sonnet run reads back intact.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from pathlib import Path
 import pytest
 from langchain_core.messages import AIMessage
 
+import books
 import committee
 import config
 from committee import (
@@ -288,3 +290,43 @@ def test_recommend_follows_the_verdict_persona(
     assert proposal.recommended_persona in proposal.orders
     assert proposal.question == "Should I trim semis?"
     assert proposal.model_name == config.SONNET_DEMO_MODEL
+
+
+def test_a_saved_sonnet_run_reads_back(
+    use_fake_model: Callable,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The newest saved run comes back from the local log with its proposal and verdict intact."""
+    monkeypatch.delenv(books.MONGODB_URI_ENV_VAR, raising=False)
+    monkeypatch.setattr(books, "SONNET_RUNS_PATH", tmp_path / "sonnet_runs.jsonl")
+    use_fake_model(
+        {
+            SentimentAnswer: SENTIMENT_ANSWER,
+            Narration: NARRATION_ANSWER,
+            PMView: PM_ANSWER,
+            CriticNotes: CRITIC_ANSWER,
+            Verdict: VERDICT_ANSWER,
+        }
+    )
+    proposal = run_committee(_fixture_snapshot(), model_name=config.SONNET_DEMO_MODEL)
+    older_run = books.RunRecord(
+        taken_at=datetime(2026, 9, 25, tzinfo=UTC),
+        proposal=Proposal(target_weights={}, orders={}),
+        nav={},
+        spy_close=500.0,
+    )
+    newer_run = books.RunRecord(
+        taken_at=datetime(2026, 9, 26, tzinfo=UTC),
+        proposal=proposal,
+        nav={persona_key: 100_000.0 for persona_key in config.PERSONAS},
+        spy_close=500.0,
+    )
+
+    assert books.latest_sonnet_run() is None
+    books.save_sonnet_run(older_run.model_dump(mode="json"))
+    books.save_sonnet_run(newer_run.model_dump(mode="json"))
+    saved_run = books.latest_sonnet_run()
+
+    assert "saved_at" in saved_run
+    assert Proposal.model_validate(saved_run["proposal"]) == proposal
