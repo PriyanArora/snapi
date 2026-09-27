@@ -108,7 +108,8 @@ class Persona:
 
     def invested_pct_for_regime(self, regime: Regime) -> float:
         """Target invested % of equity at the given macro regime."""
-        return self.max_invested_pct * REGIME_FRACTIONS[regime]
+        # Rounded so the persona table's values compare exactly (0.95 * 0.75 is 0.7124999...).
+        return round(self.max_invested_pct * REGIME_FRACTIONS[regime], 6)
 
 
 PERSONAS: dict[str, Persona] = {
