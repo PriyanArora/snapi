@@ -1,6 +1,6 @@
 """Price snapshot: download a committed CSV of daily bars and load it back.
 
-The snapshot covers the 10-stock universe, the 7 sector ETFs and SPY (R9:
+The snapshot covers the 10-stock universe, the 7 sector ETFs and SPY (Risk #9:
 yfinance rate-limits per IP, so the demo runs off a committed file instead of
 a live call). `download_price_snapshot` refreshes that file; the rest of the
 app reads it through `load_price_snapshot` and the small helpers below.
@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
+from dotenv import load_dotenv
 
 from config import BENCHMARK, ETF_BY_SECTOR, UNIVERSE
 
@@ -95,6 +96,7 @@ def latest_marks(as_of: date | None = None) -> dict[str, float]:
 
 
 if __name__ == "__main__":
+    load_dotenv()
     download_price_snapshot()
     load_price_snapshot.cache_clear()
 

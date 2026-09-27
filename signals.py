@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import date
 
 import pandas as pd
+from dotenv import load_dotenv
 from stockstats import StockDataFrame
 
 from config import (
@@ -139,6 +140,8 @@ def compute_macro_checklist(
 
 if __name__ == "__main__":
     from config import PERSONAS, UNIVERSE
+
+    load_dotenv()
 
     for ticker in UNIVERSE:
         technical = compute_technical_score(ticker)
