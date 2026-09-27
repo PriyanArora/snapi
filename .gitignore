@@ -1,0 +1,18 @@
+# Local only
+spec1/
+spec2/
+spec3/
+PRD.md
+CLAUDE.md
+WIRING.md
+
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.cache/
