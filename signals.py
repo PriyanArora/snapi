@@ -84,9 +84,12 @@ def compute_technical_score(ticker: str, as_of: date | None = None) -> Technical
     rsi = float(frame[f"rsi_{RSI_PERIOD}"].iloc[-1])
     rsi_score = _clip_to_unit_range((RSI_MIDPOINT - rsi) / RSI_SCORE_DIVISOR)
 
-    macd_column = f"macdh_{MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}"
-    macd_histogram = float(frame[macd_column].iloc[-1])
-    macd_mean_abs = frame[macd_column].tail(MACD_MEAN_ABS_LOOKBACK_DAYS).abs().mean()
+    macd_windows = f"{MACD_FAST},{MACD_SLOW},{MACD_SIGNAL}"
+    # stockstats parses only the base macd_<windows> name; reading it also builds macds_<windows>
+    macd_line = frame[f"macd_{macd_windows}"]
+    macd_histogram_series = macd_line - frame[f"macds_{macd_windows}"]
+    macd_histogram = float(macd_histogram_series.iloc[-1])
+    macd_mean_abs = macd_histogram_series.tail(MACD_MEAN_ABS_LOOKBACK_DAYS).abs().mean()
     if macd_mean_abs == 0:
         macd_score = 0.0  # flat histogram history -> nothing to normalize against
     else:
