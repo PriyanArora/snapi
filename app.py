@@ -978,11 +978,13 @@ def backtest_tab() -> None:
         return
 
     results = json.loads(config.BACKTEST_RESULTS_PATH.read_text())
+    max_name_weight = config.PERSONAS["balanced"].max_position_pct
     st.caption(
-        "Deterministic, no AI: every Monday the 10 names with a positive "
-        "technical score are held at equal weight (otherwise cash), less 5 bps "
-        "of turnover. The overlay invests 100/75/50% of that by the macro "
-        "regime known before each week, from point-in-time FRED data."
+        "Deterministic, no AI: every Monday the names with a positive technical "
+        "score at the previous close are held at equal weight, at most "
+        f"{max_name_weight:.0%} each (Balanced's per-name max), with the rest in "
+        "cash, less 5 bps of turnover. The overlay invests 100/75/50% of that by "
+        "the macro regime known before each week, from point-in-time FRED data."
     )
     # R11 / Risk #12: say plainly the window was benign, with the real count.
     st.caption(
