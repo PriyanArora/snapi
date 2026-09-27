@@ -1276,6 +1276,7 @@ dependencies = [
     { name = "snaptrade-python-sdk" },
     { name = "stockstats" },
     { name = "streamlit" },
+    { name = "streamlit-shadcn-ui" },
     { name = "yfinance" },
 ]
 
@@ -1300,6 +1301,7 @@ requires-dist = [
     { name = "snaptrade-python-sdk", specifier = "==13.0.26" },
     { name = "stockstats", specifier = "==0.6.8" },
     { name = "streamlit", specifier = ">=1.64" },
+    { name = "streamlit-shadcn-ui", specifier = ">=1.4,<2" },
     { name = "yfinance", specifier = "==1.7.0" },
 ]
 
@@ -1400,6 +1402,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ce/98/399d9b5bea64f0db9a37a800e420ba563dcde293e91d244c7d96acaeb313/streamlit-1.64.0.tar.gz", hash = "sha256:5c3f9a9dec13b5c5197a9c764ebf1a9d77f9e19c1b4af008779cb45c368961a3", size = 9535360, upload-time = "2026-09-15T19:13:53.576Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d7/8e/e635448a7fd6d92211d4ff2150356b8dffd3fcdc05c00511c61110078871/streamlit-1.64.0-py3-none-any.whl", hash = "sha256:4daf63aa9eaa5452d0edc64a5bdb0c4ad25580fe3c62c270455f3c43e9db5098", size = 10093987, upload-time = "2026-09-15T19:13:51.284Z" },
+]
+
+[[package]]
+name = "streamlit-shadcn-ui"
+version = "1.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "streamlit" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a1/dd/dfd99881fafec55386e12003aaf8710f888a47a3087179fa4618b5b82320/streamlit_shadcn_ui-1.4.0.tar.gz", hash = "sha256:8fc076dc93937927a809ef22a50bc15ec622d9871f32ff1f921c4b4cb014ce1d", size = 460752, upload-time = "2026-09-08T11:14:58.351Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bc/3f/786a9145eac955c2c9661e5c118c555d926fb5f0aaadf44e10258f0c248f/streamlit_shadcn_ui-1.4.0-py3-none-any.whl", hash = "sha256:82494a5795a14991ac92e46124271ee859fc50cad7364c7b6bc16b9348ec63df", size = 483201, upload-time = "2026-09-08T11:14:56.659Z" },
 ]
 
 [[package]]

@@ -170,7 +170,7 @@ def clear_cache(account_id: str) -> None:
 def clear_order_cache(account_id: str) -> None:
     """Forget the account's cached order lists, so the lock and order status show a batch just sent."""
     # Queued orders don't move positions or cash, so the book read stays cached.
-    for fetch in (_fetch_open_orders, _fetch_recent_orders):
+    for fetch in (_fetch_open_orders, _fetch_recent_orders, _fetch_order_history):
         _cache.pop((fetch, account_id), None)
 
 
@@ -296,6 +296,22 @@ def get_open_orders(account_id: str) -> list[dict[str, str | float | None]]:
     return _cached_read(_fetch_open_orders, account_id)
 
 
+def _fetch_order_history(account_id: str) -> list[dict[str, str | float | None]]:
+    """Read every order from the last 90 days, in every state."""
+    _note_request(account_id)
+    response = get_client().account_information.get_user_account_orders(
+        account_id=account_id,
+        state="all",
+        days=OPEN_ORDERS_LOOKBACK_DAYS,
+    )
+    return [_order_row(order) for order in response.body]
+
+
+def get_order_history(account_id: str) -> list[dict[str, str | float | None]]:
+    """Return the account's orders from the last 90 days, cached; refreshed about daily by SnapTrade."""
+    return _cached_read(_fetch_order_history, account_id)
+
+
 def has_unfilled_orders(account_id: str) -> bool:
     """Return True while any order is still open, which keeps Balanced locked (Balanced step 7, R4).
 
@@ -386,6 +402,31 @@ def list_accounts() -> list[dict[str, str | bool | None]]:
     """Return every connected account's id, name and institution (setup only)."""
     accounts = get_client().account_information.list_user_accounts().body
     return [_account_row(account) for account in accounts]
+
+
+@functools.cache
+def get_connections() -> dict[str, dict[str, str | None]]:
+    """Return each account's brokerage name, square logo URL and access ("trade" or "read"), by account id.
+
+    Read once per process: names and logos don't change while the app runs.
+    """
+    client = get_client()
+    authorizations_by_id = {}
+    for authorization in client.connections.list_brokerage_authorizations().body:
+        authorizations_by_id[authorization["id"]] = authorization
+
+    connections = {}
+    for account in client.account_information.list_user_accounts().body:
+        authorization = authorizations_by_id.get(
+            account.get("brokerage_authorization"), {}
+        )
+        brokerage = authorization.get("brokerage") or {}
+        connections[account["id"]] = {
+            "name": brokerage.get("display_name") or account.get("institution_name"),
+            "logo_url": brokerage.get("aws_s3_square_logo_url"),
+            "access": authorization.get("type"),
+        }
+    return connections
 
 
 if __name__ == "__main__":

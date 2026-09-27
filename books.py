@@ -8,9 +8,9 @@ SnapTrade read. `take_snapshot` gathers one cycle's frozen inputs and
 test builds up with no scheduler.
 
 When MONGODB_URI is set, every log is instead a MongoDB collection named
-after its file (`fills_conservative`, `run_log`, ...), because Streamlit
-Cloud's disk is wiped on sleep and redeploy (Hosting). Unset, the JSONL
-files stay, so the tests run offline.
+after its file (`fills_conservative`, `run_log`, `sonnet_runs`, ...),
+because Streamlit Cloud's disk is wiped on sleep and redeploy (Hosting).
+Unset, the JSONL files stay, so the tests run offline.
 """
 
 from __future__ import annotations
@@ -33,10 +33,19 @@ import feeds
 import prices
 import signals
 from committee import Proposal, Snapshot
-from config import BENCHMARK, DATA_DIR, PERSONAS, RUN_LOG_PATH, UNIVERSE, Regime
+from config import (
+    BENCHMARK,
+    CHATS_PATH,
+    DATA_DIR,
+    PERSONAS,
+    RUN_LOG_PATH,
+    SONNET_RUNS_PATH,
+    UNIVERSE,
+    Regime,
+)
 from external.broker_models import Fill, Order
 from external.sim import SimBroker
-from portfolio import Book, compute_book_equity
+from portfolio import Book, compute_book_equity, tickers_outside_universe
 
 FillTag = Literal["committee", "rebalance", "seed"]
 
@@ -67,6 +76,12 @@ class RunRecord(BaseModel):
     proposal: Proposal
     nav: dict[str, float]
     spy_close: float
+
+
+class SavedRunRecord(RunRecord):
+    """A finished Sonnet run kept as the UI's fallback, stamped with when it was saved."""
+
+    saved_at: datetime
 
 
 class ApprovalRecord(BaseModel):
@@ -292,8 +307,21 @@ def take_snapshot() -> Snapshot:
     holdings are never mixed in (S16).
     """
     books_by_persona = {}
-    for persona_key in PERSONAS:
-        books_by_persona[persona_key] = current_book(persona_key)
+    for persona_key, persona in PERSONAS.items():
+        book = current_book(persona_key)
+
+        # Names with no mark or sector would crash sizing, and leaving them
+        # out would log a false NAV into the forward test.
+        stale_tickers = tickers_outside_universe(book)
+        if stale_tickers:
+            raise ValueError(
+                f"{persona.display_name}'s book still holds "
+                f"{', '.join(stale_tickers)} from before the stock universe "
+                "changed. Press Reset books on the Portfolio page to re-seed "
+                "the books."
+            )
+
+        books_by_persona[persona_key] = book
 
     technical_scores = {}
     for ticker in UNIVERSE:
@@ -307,6 +335,7 @@ def take_snapshot() -> Snapshot:
         fear_greed=feeds.fetch_fear_and_greed(),
         macro=signals.compute_macro_checklist(feeds.fetch_macro_series()),
         books=books_by_persona,
+        fundamentals=feeds.fetch_fundamentals(),
     )
 
 
@@ -334,3 +363,59 @@ def log_run(snapshot: Snapshot, proposal: Proposal) -> RunRecord:
     )
     append_run_log(record)
     return record
+
+
+def save_sonnet_run(record: dict) -> None:
+    """Keep a finished run record (a dumped RunRecord) as the fallback for a failed or slow live run.
+
+    Validated first, so a record that wouldn't load back never gets saved.
+    """
+    saved_run = SavedRunRecord.model_validate(record | {"saved_at": datetime.now(UTC)})
+    _append_log(SONNET_RUNS_PATH, [saved_run])
+
+
+def latest_sonnet_run() -> dict | None:
+    """Return the newest saved Sonnet run as a plain JSON dict, or None before one is saved."""
+    collection = _log_collection(SONNET_RUNS_PATH)
+    if collection is not None:
+        # ObjectIds grow with every insert, so the highest _id is the newest.
+        return collection.find_one({}, {"_id": False}, sort=[("_id", -1)])
+
+    saved_runs = _read_log(SONNET_RUNS_PATH)
+    if not saved_runs:
+        return None
+
+    return saved_runs[-1]
+
+
+def save_chat(chat: dict) -> None:
+    """Save a Chat page conversation, replacing the earlier version with the same chat_id."""
+    collection = _log_collection(CHATS_PATH)
+    if collection is not None:
+        collection.replace_one({"chat_id": chat["chat_id"]}, chat, upsert=True)
+        return
+
+    # A JSONL file can't replace a line, so each save appends and
+    # recent_chats keeps the last version per chat_id.
+    CHATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with CHATS_PATH.open("a") as chat_log:
+        chat_log.write(json.dumps(chat) + "\n")
+
+
+def recent_chats(limit: int = 10) -> list[dict]:
+    """Return the latest saved conversations as plain JSON dicts, the most recently updated first."""
+    collection = _log_collection(CHATS_PATH)
+    if collection is not None:
+        newest_first = collection.find({}, {"_id": False}).sort("updated_at", -1)
+        return list(newest_first.limit(limit))
+
+    latest_by_chat_id = {}
+    for chat in _read_log(CHATS_PATH):
+        latest_by_chat_id[chat["chat_id"]] = chat
+
+    newest_first = sorted(
+        latest_by_chat_id.values(),
+        key=lambda chat: chat["updated_at"],
+        reverse=True,
+    )
+    return newest_first[:limit]

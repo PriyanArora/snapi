@@ -2,6 +2,8 @@
 PRD.md
 CLAUDE.md
 WIRING.md
+.agents/
+.claude/
 
 # Secrets
 .env

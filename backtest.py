@@ -2,7 +2,7 @@
 
 Our own pandas loop, not hedge_fund's backtest_fund, with no LLM or news
 calls (F16, Out of Scope). Each Monday (or the week's first open day, F19)
-it scores the 10 names at the previous trading day's close with the same
+it scores the universe's names at the previous trading day's close with the same
 compute_technical_score the live Technical analyst uses (story 4), holds
 the names with a positive score at equal weight, each capped at Balanced's
 12% per-name max (F10) with the rest in cash, from that Monday's close to

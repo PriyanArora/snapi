@@ -1,0 +1,13 @@
+# snapi's theme: a cool off-white page, navy text and Plus Jakarta Sans,
+# with shadcn-style neutral borders. One [theme] section locks light mode.
+[theme]
+base = "light"
+primaryColor = "#0F1B3D"
+backgroundColor = "#F4F6F8"
+secondaryBackgroundColor = "#E8EEF0"
+textColor = "#0F1B3D"
+borderColor = "#D8E1E4"
+showWidgetBorder = true
+baseRadius = "8px"
+font = "'Plus Jakarta Sans':https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
+headingFontWeights = [800, 700, 700, 600, 600, 600]

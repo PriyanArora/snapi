@@ -13,55 +13,58 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-# Universe and benchmark (Q1)
+# Universe and benchmark (Q1). Phase11 replaced Q1's list with household
+# names across 7 SPDR sectors.
 UNIVERSE = (
-    "NVDA",
-    "AMD",
-    "AVGO",
-    "JPM",
-    "XOM",
-    "UNH",
     "AAPL",
     "MSFT",
+    "NVDA",
+    "GOOGL",
+    "META",
     "AMZN",
-    "CAT",
+    "TSLA",
+    "KO",
+    "JPM",
+    "XOM",
+    "JNJ",
 )
 BENCHMARK = "SPY"
 
-# Sector buckets (F9) and their membership (Q2, Q3).
+# Sector buckets (F9) and their membership (Q2, Q3), one SPDR sector ETF each.
 # ETFs map to their own bucket too, so SECTOR_BY_TICKER covers both stocks
 # and the ETFs used for rebalance buys.
 SECTORS = (
-    "Semiconductors",
-    "Banks",
+    "Technology",
+    "Communication",
+    "Consumer",
+    "Staples",
+    "Financials",
     "Energy",
     "Healthcare",
-    "Big Tech",
-    "Consumer",
-    "Industrials",
 )
 
 ETF_BY_SECTOR = {
-    "Semiconductors": "SMH",
-    "Banks": "KBE",
+    "Technology": "XLK",
+    "Communication": "XLC",
+    "Consumer": "XLY",
+    "Staples": "XLP",
+    "Financials": "XLF",
     "Energy": "XLE",
     "Healthcare": "XLV",
-    "Big Tech": "XLK",
-    "Consumer": "XLY",
-    "Industrials": "XLI",
 }
 
 _STOCK_SECTOR_BY_TICKER = {
-    "NVDA": "Semiconductors",
-    "AMD": "Semiconductors",
-    "AVGO": "Semiconductors",
-    "JPM": "Banks",
+    "AAPL": "Technology",
+    "MSFT": "Technology",
+    "NVDA": "Technology",
+    "GOOGL": "Communication",
+    "META": "Communication",
+    "AMZN": "Consumer",
+    "TSLA": "Consumer",
+    "KO": "Staples",
+    "JPM": "Financials",
     "XOM": "Energy",
-    "UNH": "Healthcare",
-    "AAPL": "Big Tech",
-    "MSFT": "Big Tech",
-    "AMZN": "Big Tech",
-    "CAT": "Industrials",
+    "JNJ": "Healthcare",
 }
 SECTOR_BY_TICKER = _STOCK_SECTOR_BY_TICKER | {
     etf: sector for sector, etf in ETF_BY_SECTOR.items()
@@ -158,6 +161,26 @@ FEAR_GREED_LOW = 25
 FEAR_GREED_HIGH = 75
 FEAR_GREED_TILT = 0.10
 
+# Fundamentals tilt (the finance teammate, Phase11): a per-stock nudge in
+# the same deterministic style as the Fear & Greed tilt, with no LLM call.
+# What counts as an expensive forward P/E depends on the sector.
+FORWARD_PE_LIMIT_BY_SECTOR = {
+    "Technology": 35.0,
+    "Communication": 25.0,
+    "Consumer": 30.0,
+    "Staples": 25.0,
+    "Financials": 15.0,
+    "Energy": 15.0,
+    "Healthcare": 22.0,
+}
+FORWARD_PE_TILT = 0.05  # forward P/E above its sector's limit
+FORWARD_PE_STRETCHED_MULTIPLE = 1.5
+FORWARD_PE_STRETCHED_TILT = 0.10  # forward P/E above 1.5x the limit
+DEBT_TO_EQUITY_LIMIT = 2.0  # a ratio: 2.0 means debt is twice equity
+DEBT_TO_EQUITY_TILT = 0.05  # taken on top of the forward P/E tilt
+# Bank leverage is structural, so the debt check skips this sector.
+DEBT_TO_EQUITY_SKIPPED_SECTOR = "Financials"
+
 # Technical score inputs (F14, Q7).
 RSI_PERIOD = 14
 RSI_MIDPOINT = 50
@@ -169,16 +192,39 @@ MACD_MEAN_ABS_LOOKBACK_DAYS = 63
 SMA_FAST = 50
 SMA_SLOW = 200
 
-# LLM model choice (T15). One env var picks Haiku 4.5 (dev) or Sonnet 5 (demo).
+# LLM model choice (T15). One env var picks Haiku 4.5 (dev) or Sonnet 5 (demo)
+# as the default; the Committee page can pick any of MODEL_CHOICES per run.
 SNAPI_MODEL_ENV_VAR = "SNAPI_MODEL"
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 SONNET_DEMO_MODEL = "claude-sonnet-5"
+OPUS_MODEL = "claude-opus-5-5"
+
+# Display label -> model id.
+MODEL_CHOICES = {
+    "Haiku 4.5": DEFAULT_MODEL,
+    "Sonnet 5": SONNET_DEMO_MODEL,
+    "Opus 5.5": OPUS_MODEL,
+}
+
+# What the committee answers when the user asks nothing more specific.
+DEFAULT_QUESTION = (
+    "Given today's market, what should each of my three portfolios buy or sell?"
+)
 
 
 def get_model_name() -> str:
     """Return the LLM model id, from SNAPI_MODEL or the Haiku 4.5 default."""
     # `or`, not a get() default: .env.example's empty SNAPI_MODEL= loads as "".
     return os.environ.get(SNAPI_MODEL_ENV_VAR) or DEFAULT_MODEL
+
+
+def get_model_label(model_name: str) -> str:
+    """Return a model id's display label ("Sonnet 5"), or the id itself when it isn't one of MODEL_CHOICES."""
+    for label, choice_model_name in MODEL_CHOICES.items():
+        if model_name == choice_model_name:
+            return label
+
+    return model_name
 
 
 # Disclaimer (Q13), shown on the gate screen and the closing slide verbatim.
@@ -192,6 +238,11 @@ DISCLAIMER = (
 # collections of the same name when MONGODB_URI is set (Hosting).
 DATA_DIR = Path(__file__).resolve().parent / "data"
 RUN_LOG_PATH = DATA_DIR / "run_log.jsonl"
+# The latest Sonnet run, kept so the UI can fall back to it when a live run
+# fails or is too slow.
+SONNET_RUNS_PATH = DATA_DIR / "sonnet_runs.jsonl"
+# The Chat page's saved conversations, listed under Recent chats.
+CHATS_PATH = DATA_DIR / "chats.jsonl"
 
 # P1 backtest output (S15): backtest.py writes it, the Backtest tab reads it.
 BACKTEST_RESULTS_PATH = DATA_DIR / "backtest_results.json"

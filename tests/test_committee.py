@@ -3,12 +3,16 @@
 Setup: a fixed committed snapshot fixture and a fake chat model returning
 canned structured outputs. Checks the outcomes a user would notice at this
 seam: every persona's sector cap, per-name max and cash buffer hold on the
-book the proposed orders actually produce, and a raising analyst abstains
-without sinking the run.
+book the proposed orders actually produce, a raising analyst abstains
+without sinking the run, the verdict's persona is the one recommended,
+a saved Sonnet run reads back intact, and the app's live-run worker queues
+every node before the logged run.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import queue
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +20,8 @@ from pathlib import Path
 import pytest
 from langchain_core.messages import AIMessage
 
+import app
+import books
 import committee
 import config
 from committee import (
@@ -28,6 +34,7 @@ from committee import (
     SentimentAnswer,
     SentimentView,
     Snapshot,
+    Verdict,
     run_committee,
 )
 from external.broker_models import Order
@@ -39,10 +46,10 @@ from signals import MacroChecklist, TechnicalScore
 ALL_TICKERS = tuple(config.SECTOR_BY_TICKER)
 FIXTURE_MARKS = {ticker: 100.0 for ticker in ALL_TICKERS}
 
-# Semis and Big Tech carry a strong positive score so the per-name max and
-# the sector caps actually bind; the rest sit in a narrow, mild-conviction
-# range so they don't compete for the same limits.
-_STRONG_TICKERS = {"NVDA", "AMD", "AVGO", "AAPL", "MSFT", "AMZN"}
+# Technology and Communication carry a strong positive score so the per-name
+# max and the sector caps actually bind; the rest sit in a narrow,
+# mild-conviction range so they don't compete for the same limits.
+_STRONG_TICKERS = {"AAPL", "MSFT", "NVDA", "GOOGL", "META"}
 
 
 def _technical_score(ticker: str) -> TechnicalScore:
@@ -72,15 +79,15 @@ FIXTURE_MACRO = MacroChecklist(
     regime="risk_on",
 )
 # Balanced already holds a within-sector mix that sits just under the 30%
-# semis cap (NVDA 135, AMD 142, AVGO 143 at the $100 fixture mark): rotating
-# toward this cycle's equal-weight semis targets sells 1 share of one name
+# Technology cap (AAPL 135, MSFT 142, NVDA 143 at the $100 fixture mark): rotating
+# toward this cycle's equal-weight Technology targets sells 1 share of one name
 # while buying several of another, so the $200 floor (F11) and the cap
 # restore it can't override (F7, deviation #7) both fire for real.
 FIXTURE_BOOKS = {
     "conservative": Book(cash=100_000.0, shares={}, avg_cost={}),
     "balanced": Book(
         cash=100_000.0,
-        shares={"NVDA": 135, "AMD": 142, "AVGO": 143},
+        shares={"AAPL": 135, "MSFT": 142, "NVDA": 143},
         avg_cost={},
     ),
     "aggressive": Book(cash=100_000.0, shares={}, avg_cost={}),
@@ -109,10 +116,14 @@ NARRATION_ANSWER = Narration(
     notes=[Note(name=name, why="in line with the numbers") for name in config.UNIVERSE]
 )
 PM_ANSWER = PMView(
-    memo="Leaning into semis and Big Tech; trimming energy on weak conviction.",
+    memo="Leaning into Technology and Communication; trimming energy on weak conviction.",
     drops=[Drop(ticker="XOM", reason="conviction too weak to size")],
 )
 CRITIC_ANSWER = CriticNotes(notes="Concentration risk in a handful of mega-cap names.")
+VERDICT_ANSWER = Verdict(
+    summary="Semis and Big Tech lead; follow the aggressive book.",
+    persona="aggressive",
+)
 
 
 class FakeStructuredModel:
@@ -152,7 +163,7 @@ def use_fake_model(
     """Route committee.ask through a fake model and an isolated, throwaway cache dir."""
 
     def _install(answers: dict[type, object]) -> None:
-        def build_fake_chat_model() -> FakeChatModel:
+        def build_fake_chat_model(model_name: str) -> FakeChatModel:
             return FakeChatModel(answers)
 
         monkeypatch.setattr(committee, "LLM_CACHE_DIR", tmp_path)
@@ -219,6 +230,7 @@ def test_every_persona_respects_its_limits(use_fake_model: Callable) -> None:
             Narration: NARRATION_ANSWER,
             PMView: PM_ANSWER,
             CriticNotes: CRITIC_ANSWER,
+            Verdict: VERDICT_ANSWER,
         }
     )
 
@@ -237,6 +249,7 @@ def test_a_failing_analyst_abstains_and_the_run_completes(
             Narration: NARRATION_ANSWER,
             PMView: PM_ANSWER,
             CriticNotes: CRITIC_ANSWER,
+            Verdict: VERDICT_ANSWER,
         }
     )
 
@@ -245,3 +258,124 @@ def test_a_failing_analyst_abstains_and_the_run_completes(
     assert proposal.sentiment.abstained is True
     assert proposal.technical.abstained is False
     _assert_persona_limits_hold(proposal)
+
+
+@pytest.mark.parametrize(
+    ("verdict_answer", "expected_persona"),
+    [
+        (VERDICT_ANSWER, "aggressive"),
+        (TimeoutError("verdict timed out"), "balanced"),  # degrades like the PM
+    ],
+)
+def test_recommend_follows_the_verdict_persona(
+    use_fake_model: Callable,
+    verdict_answer: object,
+    expected_persona: str,
+) -> None:
+    """The recommended persona is the verdict's pick, and a failing verdict falls back to Balanced."""
+    use_fake_model(
+        {
+            SentimentAnswer: SENTIMENT_ANSWER,
+            Narration: NARRATION_ANSWER,
+            PMView: PM_ANSWER,
+            CriticNotes: CRITIC_ANSWER,
+            Verdict: verdict_answer,
+        }
+    )
+
+    proposal = run_committee(
+        _fixture_snapshot(),
+        question="Should I trim semis?",
+        model_name=config.SONNET_DEMO_MODEL,
+    )
+
+    assert proposal.verdict.persona == expected_persona
+    assert proposal.recommended_persona == expected_persona
+    assert proposal.recommended_persona in proposal.orders
+    assert proposal.question == "Should I trim semis?"
+    assert proposal.model_name == config.SONNET_DEMO_MODEL
+
+
+def test_a_saved_sonnet_run_reads_back(
+    use_fake_model: Callable,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The newest saved run comes back from the local log with its proposal and verdict intact."""
+    monkeypatch.delenv(books.MONGODB_URI_ENV_VAR, raising=False)
+    monkeypatch.setattr(books, "SONNET_RUNS_PATH", tmp_path / "sonnet_runs.jsonl")
+    use_fake_model(
+        {
+            SentimentAnswer: SENTIMENT_ANSWER,
+            Narration: NARRATION_ANSWER,
+            PMView: PM_ANSWER,
+            CriticNotes: CRITIC_ANSWER,
+            Verdict: VERDICT_ANSWER,
+        }
+    )
+    proposal = run_committee(_fixture_snapshot(), model_name=config.SONNET_DEMO_MODEL)
+    older_run = books.RunRecord(
+        taken_at=datetime(2026, 9, 25, tzinfo=UTC),
+        proposal=Proposal(target_weights={}, orders={}),
+        nav={},
+        spy_close=500.0,
+    )
+    newer_run = books.RunRecord(
+        taken_at=datetime(2026, 9, 26, tzinfo=UTC),
+        proposal=proposal,
+        nav={persona_key: 100_000.0 for persona_key in config.PERSONAS},
+        spy_close=500.0,
+    )
+
+    assert books.latest_sonnet_run() is None
+    books.save_sonnet_run(older_run.model_dump(mode="json"))
+    books.save_sonnet_run(newer_run.model_dump(mode="json"))
+    saved_run = books.latest_sonnet_run()
+
+    assert "saved_at" in saved_run
+    assert Proposal.model_validate(saved_run["proposal"]) == proposal
+
+
+def _snapshot_with_spy() -> Snapshot:
+    """Return the fixture snapshot with SPY marked too, since logging a run reads its close."""
+    return dataclasses.replace(
+        _fixture_snapshot(),
+        marks=FIXTURE_MARKS | {config.BENCHMARK: 500.0},
+    )
+
+
+def test_a_live_run_queues_every_node_then_the_logged_run(
+    use_fake_model: Callable,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The worker queues each node's fields, then the run it logged with this question and model, saved as the Sonnet fallback."""
+    monkeypatch.delenv(books.MONGODB_URI_ENV_VAR, raising=False)
+    monkeypatch.setattr(books, "RUN_LOG_PATH", tmp_path / "run_log.jsonl")
+    monkeypatch.setattr(books, "SONNET_RUNS_PATH", tmp_path / "sonnet_runs.jsonl")
+    monkeypatch.setattr(books, "take_snapshot", _snapshot_with_spy)
+    use_fake_model(
+        {
+            SentimentAnswer: SENTIMENT_ANSWER,
+            Narration: NARRATION_ANSWER,
+            PMView: PM_ANSWER,
+            CriticNotes: CRITIC_ANSWER,
+            Verdict: VERDICT_ANSWER,
+        }
+    )
+    updates = queue.Queue()
+
+    app.stream_committee_run("Should I trim semis?", config.SONNET_DEMO_MODEL, updates)
+
+    events = []
+    while not updates.empty():
+        events.append(updates.get_nowait())
+    event_kinds = [event_kind for event_kind, _ in events]
+    run_record = events[-1][1]
+    # One update per graph node: three analysts, pm, size, critic, verdict, recommend.
+    assert event_kinds == ["update"] * 8 + ["done"]
+    assert events[-2][1] == {"recommended_persona": "aggressive"}
+    assert run_record["proposal"]["question"] == "Should I trim semis?"
+    assert run_record["proposal"]["model_name"] == config.SONNET_DEMO_MODEL
+    assert books.read_run_log() == [run_record]
+    assert books.latest_sonnet_run()["taken_at"] == run_record["taken_at"]

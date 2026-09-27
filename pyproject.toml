@@ -17,6 +17,7 @@ dependencies = [
     "requests",
     "python-dotenv",
     "pymongo>=4.18.2",
+    "streamlit-shadcn-ui>=1.4,<2",
 ]
 
 [dependency-groups]

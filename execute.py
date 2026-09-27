@@ -254,7 +254,7 @@ def _seed_proposal(persona_key: str, regime: Regime) -> Proposal:
     """Return the equal-conviction opening proposal for the persona's empty book (S16).
 
     Equal conviction through the same sizing chain and cap layer as an
-    approved run; no LLM call and no F&G tilt.
+    approved run; no LLM call and no F&G or fundamentals tilt.
     """
     persona = PERSONAS[persona_key]
     empty_book = Book(cash=persona.starting_cash, shares={}, avg_cost={})
@@ -265,6 +265,7 @@ def _seed_proposal(persona_key: str, regime: Regime) -> Proposal:
         empty_book,
         prices.latest_marks(),
         fear_greed=None,
+        fundamentals={},
         dropped_tickers=set(),
     )
     return Proposal(

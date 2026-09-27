@@ -7,7 +7,7 @@ chain (step 3, called with the sized target weights) and by the Rebalance
 button (called with the book's own current weights, S8/user story 30) — the
 caller decides what "target weights" means, this function only enforces
 the caps and diversifies whatever it is handed. `size_persona` runs the
-full chain — blend, Fear & Greed tilt, PM drops, per-name max, then
+full chain — blend, Fear & Greed and fundamentals tilts, PM drops, per-name max, then
 `rebalance` — and is called by the committee's size node (preview) and
 again by `execute` against a fresh snapshot.
 """
@@ -22,6 +22,7 @@ from external.construction import blend_signals
 from external.execution import build_orders
 from external.limits import RiskLimits, apply_limits
 from external.models import Signal
+from feeds import Fundamentals
 
 SHARE_ROUNDING_TOLERANCE = 1e-9
 
@@ -58,6 +59,17 @@ def compute_book_equity(book: Book, marks: dict[str, float]) -> float:
         shares * marks[ticker] for ticker, shares in book.shares.items()
     )
     return book.cash + positions_value
+
+
+def tickers_outside_universe(book: Book) -> list[str]:
+    """Return the held tickers that are neither a universe stock nor a sector ETF, sorted.
+
+    A universe change leaves them in a book until Reset books re-seeds it;
+    they have no price mark or sector, so nothing can value or size them.
+    """
+    return sorted(
+        ticker for ticker in book.shares if ticker not in config.SECTOR_BY_TICKER
+    )
 
 
 def weights_by_ticker(book: Book, marks: dict[str, float]) -> dict[str, float]:
@@ -359,23 +371,85 @@ def get_fear_greed_tilt(fear_greed: float | None) -> float:
     return 0.0
 
 
+def _forward_pe_tilt(forward_pe: float | None, sector: str) -> float:
+    """Return the forward P/E part of the fundamentals tilt: -0.05 above the sector's limit, -0.10 above 1.5x it."""
+    # No number, or no forward earnings to price the stock on: no signal.
+    if forward_pe is None or forward_pe <= 0:
+        return 0.0
+
+    limit = config.FORWARD_PE_LIMIT_BY_SECTOR[sector]
+    if forward_pe > limit * config.FORWARD_PE_STRETCHED_MULTIPLE:
+        return -config.FORWARD_PE_STRETCHED_TILT
+
+    if forward_pe > limit:
+        return -config.FORWARD_PE_TILT
+
+    return 0.0
+
+
+def _debt_to_equity_tilt(debt_to_equity: float | None, sector: str) -> float:
+    """Return the debt part of the fundamentals tilt: -0.05 above the debt-to-equity limit."""
+    # Bank leverage is structural, not a warning sign.
+    if sector == config.DEBT_TO_EQUITY_SKIPPED_SECTOR:
+        return 0.0
+
+    if debt_to_equity is None or debt_to_equity <= 0:
+        return 0.0
+
+    if debt_to_equity > config.DEBT_TO_EQUITY_LIMIT:
+        return -config.DEBT_TO_EQUITY_TILT
+
+    return 0.0
+
+
+def get_fundamentals_tilt(ticker: str, fundamentals: dict[str, Fundamentals]) -> float:
+    """Return one stock's fundamentals tilt: 0 down to -0.15, for a forward P/E stretched for its sector and high debt.
+
+    Missing data skips that part, like the Fear & Greed tilt when its feed is down.
+    """
+    ticker_fundamentals = fundamentals.get(ticker)
+    if ticker_fundamentals is None:
+        return 0.0
+
+    sector = config.SECTOR_BY_TICKER[ticker]
+    forward_pe_tilt = _forward_pe_tilt(ticker_fundamentals.forward_pe, sector)
+    debt_tilt = _debt_to_equity_tilt(ticker_fundamentals.debt_to_equity, sector)
+    return forward_pe_tilt + debt_tilt
+
+
 def _tilted(signal: Signal, tilt: float) -> Signal:
     """Shift one analyst signal by the tilt, kept inside blend_signals' [-1, 1] range."""
     tilted_value = max(-1.0, min(1.0, signal.value + tilt))
     return signal.model_copy(update={"value": tilted_value})
 
 
+def _tilted_signals(
+    signals: list[Signal],
+    fear_greed: float | None,
+    fundamentals: dict[str, Fundamentals],
+) -> list[Signal]:
+    """Shift every analyst signal by the market's Fear & Greed tilt plus its own stock's fundamentals tilt."""
+    market_tilt = get_fear_greed_tilt(fear_greed)
+
+    tilted_signals = []
+    for signal in signals:
+        stock_tilt = get_fundamentals_tilt(signal.ticker, fundamentals)
+        tilted_signals.append(_tilted(signal, market_tilt + stock_tilt))
+
+    return tilted_signals
+
+
 def blend_convictions(
     signals: list[Signal],
     fear_greed: float | None,
+    fundamentals: dict[str, Fundamentals],
 ) -> dict[str, float]:
-    """Return F12's conviction per ticker (0.6 x Technical + 0.4 x Sentiment), tilted by Q6, for the PM's prompt.
+    """Return F12's conviction per ticker (0.6 x Technical + 0.4 x Sentiment), tilted by Q6 and fundamentals, for the PM's prompt.
 
     This is the same number `size_persona` sizes on, so the PM reasons over
     the number that is actually traded (Q6, F12).
     """
-    tilt = get_fear_greed_tilt(fear_greed)
-    tilted_signals = [_tilted(signal, tilt) for signal in signals]
+    tilted_signals = _tilted_signals(signals, fear_greed, fundamentals)
     blend = blend_signals(
         tilted_signals,
         MODEL_WEIGHTS,
@@ -393,20 +467,21 @@ def size_persona(
     book: Book,
     marks: dict[str, float],
     fear_greed: float | None,
+    fundamentals: dict[str, Fundamentals],
     dropped_tickers: set[str],
 ) -> RebalanceResult:
     """Run the PRD sizing chain for one persona and return its targets and orders.
 
-    Blend (F12, gross = the regime's invested %), F&G tilt (Q6), PM drops
-    (R1), per-name max (F10), then the sector-cap layer, whole-share orders
-    and the $200 floor inside `rebalance` (F5-F8, F11, Q9).
+    Blend (F12, gross = the regime's invested %), F&G and fundamentals
+    tilts (Q6), PM drops (R1), per-name max (F10), then the sector-cap
+    layer, whole-share orders and the $200 floor inside `rebalance`
+    (F5-F8, F11, Q9).
     """
     invested_pct = persona.invested_pct_for_regime(regime)
 
-    # Model weights sum to 1, so shifting every analyst's value by the tilt
-    # shifts the blended conviction by the same amount (Q6).
-    tilt = get_fear_greed_tilt(fear_greed)
-    tilted_signals = [_tilted(signal, tilt) for signal in signals]
+    # Model weights sum to 1, so shifting every analyst's value by a stock's
+    # tilt shifts its blended conviction by the same amount (Q6).
+    tilted_signals = _tilted_signals(signals, fear_greed, fundamentals)
     blend = blend_signals(
         tilted_signals,
         MODEL_WEIGHTS,
