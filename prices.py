@@ -72,9 +72,12 @@ def load_price_snapshot() -> pd.DataFrame:
 
 
 def close_history(ticker: str, as_of: date | None = None) -> pd.Series:
-    """Return `ticker`'s daily close prices indexed by date, optionally up to `as_of`."""
+    """Return the ticker's daily closes indexed by date, optionally up to `as_of`."""
     snapshot = load_price_snapshot()
     closes = snapshot[snapshot["ticker"] == ticker].set_index("date")["close"]
+    if closes.empty:
+        raise KeyError(f"{ticker!r} is not in the price snapshot")
+
     if as_of is not None:
         closes = closes[closes.index <= pd.Timestamp(as_of)]
 
