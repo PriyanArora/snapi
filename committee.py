@@ -9,12 +9,13 @@ transactional, so one failing branch would otherwise cancel the others.
 
 `run_committee(snapshot) -> proposal` is the entry point for tests and for
 `books.take_snapshot` + Approve; `app.py` instead streams `build_graph()` in
-"updates" mode and calls `proposal_from_state` on the merged result.
+"updates" mode and calls `build_proposal` on the merged result.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,8 +34,12 @@ from external.broker_models import Order
 from external.cache import PromptCache, prompt_key
 from external.models import Signal
 from feeds import TickerNews
-from portfolio import Book, blended_convictions, size_persona
+from portfolio import Book, blend_convictions, get_fear_greed_tilt, size_persona
 from signals import MacroChecklist, TechnicalScore
+
+# R12: tracing off, pinned here rather than left to the shell default, since
+# it would otherwise send prompts and portfolio data to a third-party cloud.
+os.environ["LANGSMITH_TRACING"] = "false"
 
 LLM_CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "llm"
 MAX_OUTPUT_TOKENS = 8000  # LLM call conventions: about 8k prevents truncation
@@ -183,10 +188,12 @@ MACRO_PROMPT = (
 )
 PM_PROMPT = (
     "You are the Portfolio Manager on an investment committee. You are given "
-    "each ticker's technical score, sentiment score, blended conviction and "
+    "each ticker's technical score, sentiment score, blended conviction, the "
+    "market-level Fear & Greed tilt already folded into that conviction and "
     "the current regime. Write a short memo on the overall stance. You may "
-    "drop a name with a stated reason if you think it should not be traded "
-    "this cycle, but you can never add a name or change a size."
+    "drop a name the book should not hold, with a stated reason: a drop sets "
+    "its target to zero and sells any shares held. You can never add a name "
+    "or change a size."
 )
 CRITIC_PROMPT = (
     "You are the devil's-advocate critic on an investment committee. You are "
@@ -201,7 +208,7 @@ class AskError(Exception):
     """Raised when the model's structured answer can't be parsed; the node abstains."""
 
 
-def chat_model() -> BaseChatModel:
+def build_chat_model() -> BaseChatModel:
     """Build the committee's Claude client for the model `config.get_model_name()` picks.
 
     Effort goes to Sonnet 5 only, because Haiku 4.5 rejects it; temperature,
@@ -234,7 +241,7 @@ def ask[AnswerT: BaseModel](
     if cached is not None:
         return schema.model_validate(cached["parsed"])
 
-    structured_model = chat_model().with_structured_output(
+    structured_model = build_chat_model().with_structured_output(
         schema,
         method="json_schema",
         include_raw=True,
@@ -322,7 +329,9 @@ def technical_node(state: CommitteeState) -> dict[str, Report]:
     reasons = {
         note.name: note.why for note in answer.notes if note.name in config.UNIVERSE
     }
-    scores = {ticker: indicators.score for ticker, indicators in technical.items()}
+    # Only the universe is scored, even if the snapshot also carries technical
+    # scores for ETFs or the benchmark (F1, Q1).
+    scores = {ticker: technical[ticker].score for ticker in config.UNIVERSE}
     return {"technical": Report(score=scores, why=reasons)}
 
 
@@ -404,7 +413,12 @@ def _pm_prompt(state: CommitteeState, convictions: dict[str, float]) -> str:
     """Render each ticker's technical/sentiment scores, blended conviction and both whys."""
     technical = state["technical"]
     sentiment = state["sentiment"]
-    lines = [f"regime: {state['snapshot'].macro.regime}"]
+    fear_greed = state["snapshot"].fear_greed
+    tilt = get_fear_greed_tilt(fear_greed)
+    lines = [
+        f"regime: {state['snapshot'].macro.regime}",
+        f"fear_greed: {fear_greed} (tilt {tilt:+.2f})",
+    ]
     for ticker in config.UNIVERSE:
         lines.append(
             f"{ticker}: technical={technical.score.get(ticker)} "
@@ -419,7 +433,9 @@ def _pm_prompt(state: CommitteeState, convictions: dict[str, float]) -> str:
 
 def pm_node(state: CommitteeState) -> dict[str, PMView]:
     """Portfolio Manager: a memo plus drop-only vetoes (R1); conviction is F12, in code."""
-    convictions = blended_convictions(_analyst_signals(state))
+    convictions = blend_convictions(
+        _analyst_signals(state), state["snapshot"].fear_greed
+    )
     try:
         answer = ask("pm", PM_PROMPT, _pm_prompt(state, convictions), PMView)
     except Exception as error:
@@ -532,7 +548,7 @@ def build_graph() -> CompiledStateGraph:
     return graph.compile()
 
 
-def proposal_from_state(state: CommitteeState) -> Proposal:
+def build_proposal(state: CommitteeState) -> Proposal:
     """Assemble the approvable Proposal from a finished run (also used after streaming in app.py)."""
     return Proposal(
         target_weights=state["target_weights"],
@@ -548,4 +564,4 @@ def proposal_from_state(state: CommitteeState) -> Proposal:
 def run_committee(snapshot: Snapshot) -> Proposal:
     """Run one committee cycle for all three personas and return the proposal Approve will execute."""
     final_state = build_graph().invoke({"snapshot": snapshot})
-    return proposal_from_state(final_state)
+    return build_proposal(final_state)
