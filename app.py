@@ -835,6 +835,7 @@ CHART_GRID_COLOR = "rgba(15, 27, 61, 0.08)"
 # Blue, teal, amber, violet in a fixed order: brand-leaning hues with enough
 # chroma to stay apart for colorblind readers on the off-white page.
 CHART_SERIES_COLORS = ["#2F5DA8", "#1E9A96", "#D9822B", "#8A5CC2"]
+BENCHMARK_LINE = {"color": "#8A94A6", "dash": "dash"}
 ACCOUNT_LABELS = {
     "alpaca_paper": "trades on Alpaca Paper through SnapTrade",
     "simulator": "trades on the simulator",
@@ -862,6 +863,14 @@ SANDBOX_COLUMNS = [
     ui.TableColumn(key="units", label="Units", align="right"),
     ui.TableColumn(key="price", label="Price", align="right"),
     ui.TableColumn(key="cost_basis", label="Cost basis", align="right"),
+]
+BACKTEST_COLUMNS = [
+    ui.TableColumn(key="curve", label="Curve"),
+    ui.TableColumn(key="total_return", label="Total return", align="right"),
+    ui.TableColumn(key="annualized_return", label="Annualized return", align="right"),
+    ui.TableColumn(key="sharpe", label="Sharpe", align="right"),
+    ui.TableColumn(key="max_drawdown", label="Max drawdown", align="right"),
+    ui.TableColumn(key="excess_return", label="Excess vs SPY", align="right"),
 ]
 
 
@@ -1320,12 +1329,6 @@ def forward_test_tab() -> None:
         )
         return
 
-    first_run_day = runs[0]["taken_at"][:10]
-    st.caption(
-        f"Forward test started today ({first_run_day}). Weekend runs are marked "
-        "at Friday's close, so the lines start flat."
-    )
-
     run_times = [run["taken_at"] for run in runs]
     figure = go.Figure()
     for persona_key, persona in config.PERSONAS.items():
@@ -1343,10 +1346,16 @@ def forward_test_tab() -> None:
         y=normalized(spy_closes),
         name=config.BENCHMARK,
         mode="lines+markers",
-        line={"color": "gray", "dash": "dash"},
+        line=BENCHMARK_LINE,
     )
-    figure.update_layout(yaxis_title="Value (first run = 100)", height=420)
-    st.plotly_chart(figure, key="forward_test")
+    figure.update_layout(yaxis_title="Value (first run = 100)")
+    st.plotly_chart(style_chart(figure, height=420), key="forward_test")
+
+    first_run_day = runs[0]["taken_at"][:10]
+    st.caption(
+        f"Forward test started today ({first_run_day}). Weekend runs are marked "
+        "at Friday's close, so the lines start flat."
+    )
 
 
 def backtest_metric_rows(metrics_by_curve: dict[str, dict[str, float]]) -> list[dict]:
@@ -1355,12 +1364,12 @@ def backtest_metric_rows(metrics_by_curve: dict[str, dict[str, float]]) -> list[
     for curve_name, metrics in metrics_by_curve.items():
         rows.append(
             {
-                "Curve": curve_name,
-                "Total return": f"{metrics['total_return']:.1%}",
-                "Annualized return": f"{metrics['annualized_return']:.1%}",
-                "Sharpe": f"{metrics['sharpe']:.2f}",
-                "Max drawdown": f"{metrics['max_drawdown']:.1%}",
-                "Excess vs SPY": f"{metrics['excess_return_vs_spy']:+.1%}",
+                "curve": curve_name,
+                "total_return": f"{metrics['total_return']:.1%}",
+                "annualized_return": f"{metrics['annualized_return']:.1%}",
+                "sharpe": f"{metrics['sharpe']:.2f}",
+                "max_drawdown": f"{metrics['max_drawdown']:.1%}",
+                "excess_return": f"{metrics['excess_return_vs_spy']:+.1%}",
             }
         )
 
@@ -1374,6 +1383,27 @@ def backtest_tab() -> None:
         return
 
     results = json.loads(config.BACKTEST_RESULTS_PATH.read_text())
+    figure = go.Figure()
+    for curve_name, growth in results["growth"].items():
+        line_style = None
+        if curve_name == config.BENCHMARK:
+            line_style = BENCHMARK_LINE
+
+        figure.add_scatter(
+            x=results["dates"],
+            y=normalized(growth),
+            name=curve_name,
+            mode="lines",
+            line=line_style,
+        )
+    figure.update_layout(yaxis_title="Value (start = 100)", hovermode="x unified")
+    st.plotly_chart(style_chart(figure, height=420), key="backtest")
+    ui.table(
+        backtest_metric_rows(results["metrics"]),
+        BACKTEST_COLUMNS,
+        key="backtest_metrics",
+    )
+
     max_name_weight = config.PERSONAS["balanced"].max_position_pct
     st.caption(
         "Deterministic, no AI: every Monday the names with a positive technical "
@@ -1392,27 +1422,6 @@ def backtest_tab() -> None:
         "look like staying fully invested. FRED's high-yield spread history only "
         "starts in 2023, so there is no 2020 or 2022 stress test."
     )
-
-    figure = go.Figure()
-    for curve_name, growth in results["growth"].items():
-        line_style = None
-        if curve_name == config.BENCHMARK:
-            line_style = {"color": "gray", "dash": "dash"}
-
-        figure.add_scatter(
-            x=results["dates"],
-            y=normalized(growth),
-            name=curve_name,
-            mode="lines",
-            line=line_style,
-        )
-    figure.update_layout(
-        yaxis_title="Value (start = 100)",
-        hovermode="x unified",
-        height=420,
-    )
-    st.plotly_chart(figure, key="backtest")
-    st.dataframe(backtest_metric_rows(results["metrics"]), hide_index=True)
 
 
 def format_long_date(timestamp: str | None) -> str:
