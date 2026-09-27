@@ -52,7 +52,7 @@ class RebalanceResult:
     after_sector_weights: dict[str, float]
 
 
-def book_equity(book: Book, marks: dict[str, float]) -> float:
+def compute_book_equity(book: Book, marks: dict[str, float]) -> float:
     """Total book value: cash plus every position marked at its current price."""
     positions_value = sum(
         shares * marks[ticker] for ticker, shares in book.shares.items()
@@ -62,7 +62,7 @@ def book_equity(book: Book, marks: dict[str, float]) -> float:
 
 def weights_by_ticker(book: Book, marks: dict[str, float]) -> dict[str, float]:
     """Return each held ticker's weight, as a fraction of the book's equity."""
-    equity = book_equity(book, marks)
+    equity = compute_book_equity(book, marks)
     return {
         ticker: shares * marks[ticker] / equity
         for ticker, shares in book.shares.items()
@@ -192,10 +192,9 @@ def _weights_after_orders(
 ) -> dict[str, float]:
     """Return each ticker's weight after `orders` fill, not the pre-floor target.
 
-    A cap-restoring sell can fall under the $200 floor and get dropped
-    (F7 vs F11), so the book's real post-trade weight can sit above the
-    target the floor left on paper. The before/after view reports this,
-    the book that actually results, rather than the untouched target.
+    `orders` already reflects any sub-$200 order the floor dropped, so
+    this is the book that actually results from a cycle, not the target
+    left on paper before the floor and the cap/limit restores ran.
     """
     shares_after = dict(book.shares)
     for order in orders:
@@ -209,23 +208,73 @@ def _weights_after_orders(
     }
 
 
-def orders_for_targets(
+def _is_large_enough(order: Order) -> bool:
+    """Return whether `order` clears the $200 trade floor (F11)."""
+    return order.price * order.quantity >= config.MIN_TRADE_USD
+
+
+def _cash_after_orders(book: Book, orders: list[Order]) -> float:
+    """Return the book's cash once every order in `orders` has filled."""
+    cash = book.cash
+    for order in orders:
+        cash += order.price * order.quantity * (1 if order.side == "sell" else -1)
+    return cash
+
+
+def _breaks_a_limit(
+    book: Book,
+    orders: list[Order],
+    marks: dict[str, float],
+    equity: float,
+    caps_persona: config.Persona,
+    invested_pct: float,
+) -> bool:
+    """Return whether the book that `orders` produce breaks a hard limit (F7, F10, F11).
+
+    Checked against `caps_persona`: the per-name maximum on every stock
+    (ETFs are exempt, Q9), every sector cap, and cash against
+    `invested_pct`'s buffer.
+    """
+    weights_after = _weights_after_orders(book, orders, marks, equity)
+    for ticker in config.UNIVERSE:
+        if weights_after.get(ticker, 0.0) > caps_persona.max_position_pct:
+            return True
+
+    for sector_weight in _sector_totals(weights_after).values():
+        if sector_weight > caps_persona.sector_cap:
+            return True
+
+    cash_floor = equity * (1 - invested_pct)
+    return _cash_after_orders(book, orders) < cash_floor
+
+
+def build_orders_for_targets(
     book: Book,
     target_weights: dict[str, float],
     marks: dict[str, float],
-    sector_cap: float,
+    caps_persona: config.Persona,
+    invested_pct: float,
 ) -> list[Order]:
     """Return whole-share orders that move `book` to `target_weights` (sizing chain steps 4-5).
 
     Builds orders with `build_orders`, then drops any order under
-    `config.MIN_TRADE_USD` (F11) — except a sell in a sector that is
-    currently over `sector_cap`. That sell is kept even under $200,
-    because the hard cap (F7) outranks the trade floor (F11); see PRD
-    "What changed during build" row 7. Shared by `rebalance` (preview) and
-    `execute.execute` (fresh re-derivation) so both size orders the same
-    way.
+    `config.MIN_TRADE_USD` (F11) -- except a sell whose sector is still
+    over `caps_persona.sector_cap` once every kept order fills. That sell
+    is kept even under $200, because the hard cap (F7) outranks the trade
+    floor; the exemption is decided on the post-trade book, not the
+    pre-trade one, so a same-sector buy can't push a capped sector over
+    while its own dropped sell sits on paper (PRD "What changed during
+    build" row 7).
+
+    If the floored book still breaks a per-name max, a sector cap or the
+    cash buffer, every dropped sell is restored: a sell only ever moves
+    the book toward `target_weights`, which already satisfies every limit,
+    so restoring it can't create a new breach (deviation #7's own logic,
+    extended to F10 and F11's cash buffer). Shared by `rebalance` (preview)
+    and `execute.execute` (fresh re-derivation) so both size orders the
+    same way.
     """
-    equity = book_equity(book, marks)
+    equity = compute_book_equity(book, marks)
 
     # Absorbs float round-trip error (e.g. weight*equity/mark landing a hair
     # under a held share count) before build_orders floors shares, so a
@@ -237,23 +286,31 @@ def orders_for_targets(
         equity * (1 + SHARE_ROUNDING_TOLERANCE),
     )
 
+    large_enough_orders = [order for order in orders if _is_large_enough(order)]
+    post_sector_weights = _sector_totals(
+        _weights_after_orders(book, large_enough_orders, marks, equity)
+    )
     over_cap_sectors = {
         sector
-        for sector, weight in sector_weights(book, marks).items()
-        if weight > sector_cap
+        for sector, weight in post_sector_weights.items()
+        if weight > caps_persona.sector_cap
     }
 
-    kept_orders = []
+    floored_orders = []
     for order in orders:
-        is_large_enough = order.price * order.quantity >= config.MIN_TRADE_USD
         restores_cap = (
             order.side == "sell"
             and config.SECTOR_BY_TICKER.get(order.ticker) in over_cap_sectors
         )
-        if is_large_enough or restores_cap:
-            kept_orders.append(order)
+        if _is_large_enough(order) or restores_cap:
+            floored_orders.append(order)
 
-    return kept_orders
+    if _breaks_a_limit(book, floored_orders, marks, equity, caps_persona, invested_pct):
+        return [
+            order for order in orders if order.side == "sell" or _is_large_enough(order)
+        ]
+
+    return floored_orders
 
 
 def rebalance(
@@ -276,7 +333,7 @@ def rebalance(
     lets a book be checked against a stricter persona's caps (R3); it
     defaults to `persona`.
 
-    Builds whole-share orders through `orders_for_targets`, which drops
+    Builds whole-share orders through `build_orders_for_targets`, which drops
     trades under `config.MIN_TRADE_USD` except cap-restoring sells
     (F11, F7, sizing chain steps 4-5).
     """
@@ -295,8 +352,10 @@ def rebalance(
         caps_persona.sector_cap,
     )
 
-    orders = orders_for_targets(book, final_weights, marks, caps_persona.sector_cap)
-    equity = book_equity(book, marks)
+    orders = build_orders_for_targets(
+        book, final_weights, marks, caps_persona, invested_pct
+    )
+    equity = compute_book_equity(book, marks)
 
     return RebalanceResult(
         target_weights=final_weights,
@@ -308,7 +367,7 @@ def rebalance(
     )
 
 
-def fear_greed_tilt(fear_greed: float | None) -> float:
+def get_fear_greed_tilt(fear_greed: float | None) -> float:
     """Return Q6's market-level conviction tilt: +0.10 below 25, -0.10 above 75, else 0."""
     if fear_greed is None:
         return 0.0  # feed unavailable -> tilt skipped ($0 Cost Guarantee)
@@ -328,10 +387,19 @@ def _tilted(signal: Signal, tilt: float) -> Signal:
     return signal.model_copy(update={"value": tilted_value})
 
 
-def blended_convictions(signals: list[Signal]) -> dict[str, float]:
-    """Return F12's conviction per ticker (0.6 x Technical + 0.4 x Sentiment), for the PM's prompt."""
+def blend_convictions(
+    signals: list[Signal],
+    fear_greed: float | None,
+) -> dict[str, float]:
+    """Return F12's conviction per ticker (0.6 x Technical + 0.4 x Sentiment), tilted by Q6, for the PM's prompt.
+
+    This is the same number `size_persona` sizes on, so the PM reasons over
+    the number that is actually traded (Q6, F12).
+    """
+    tilt = get_fear_greed_tilt(fear_greed)
+    tilted_signals = [_tilted(signal, tilt) for signal in signals]
     blend = blend_signals(
-        signals,
+        tilted_signals,
         MODEL_WEIGHTS,
         1.0,
         mode="long_only",
@@ -359,7 +427,7 @@ def size_persona(
 
     # Model weights sum to 1, so shifting every analyst's value by the tilt
     # shifts the blended conviction by the same amount (Q6).
-    tilt = fear_greed_tilt(fear_greed)
+    tilt = get_fear_greed_tilt(fear_greed)
     tilted_signals = [_tilted(signal, tilt) for signal in signals]
     blend = blend_signals(
         tilted_signals,
