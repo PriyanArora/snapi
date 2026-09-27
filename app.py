@@ -179,6 +179,12 @@ header[data-testid="stHeader"] { display: none; }
   letter-spacing: -0.03em;
   color: #0F1B3D;
 }
+[class*="st-key-portfolio_card_"] {
+  background: rgba(255, 255, 255, 0.7);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-radius: 14px;
+}
 </style>
 """
 
@@ -1289,21 +1295,103 @@ def committee_tab() -> None:
         render_approval_section(picked_run, is_approvable)
 
 
+CHART_FONT = "Plus Jakarta Sans, sans-serif"
+CHART_TEXT_COLOR = "#0F1B3D"
+CHART_MUTED_COLOR = "#56637F"
+CHART_GRID_COLOR = "rgba(15, 27, 61, 0.08)"
+# Blue, teal, amber, violet in a fixed order: brand-leaning hues with enough
+# chroma to stay apart for colorblind readers on the off-white page.
+CHART_SERIES_COLORS = ["#2F5DA8", "#1E9A96", "#D9822B", "#8A5CC2"]
+BENCHMARK_LINE = {"color": "#8A94A6", "dash": "dash"}
+ACCOUNT_LABELS = {
+    "alpaca_paper": "trades on Alpaca Paper through SnapTrade",
+    "simulator": "trades on the simulator",
+}
+REBALANCE_NOTE = (
+    "Trims any sector over its cap pro-rata and buys ETFs for the most "
+    "underweight sectors, with no AI calls. Nothing trades until you approve "
+    "the preview."
+)
+SANDBOX_NOTE = (
+    "Pre-filled demo holdings from SnapTrade's read-only Sandbox. "
+    "They are not part of any persona's book."
+)
+HOLDINGS_COLUMNS = [
+    ui.TableColumn(key="ticker", label="Ticker"),
+    ui.TableColumn(key="sector", label="Sector"),
+    ui.TableColumn(key="shares", label="Shares", align="right"),
+    ui.TableColumn(key="price", label="Price", align="right"),
+    ui.TableColumn(key="value", label="Value", align="right"),
+    ui.TableColumn(key="weight", label="Weight", align="right"),
+    ui.TableColumn(key="avg_cost", label="Avg cost", align="right"),
+]
+SANDBOX_COLUMNS = [
+    ui.TableColumn(key="ticker", label="Ticker"),
+    ui.TableColumn(key="units", label="Units", align="right"),
+    ui.TableColumn(key="price", label="Price", align="right"),
+    ui.TableColumn(key="cost_basis", label="Cost basis", align="right"),
+]
+BACKTEST_COLUMNS = [
+    ui.TableColumn(key="curve", label="Curve"),
+    ui.TableColumn(key="total_return", label="Total return", align="right"),
+    ui.TableColumn(key="annualized_return", label="Annualized return", align="right"),
+    ui.TableColumn(key="sharpe", label="Sharpe", align="right"),
+    ui.TableColumn(key="max_drawdown", label="Max drawdown", align="right"),
+    ui.TableColumn(key="excess_return", label="Excess vs SPY", align="right"),
+]
+
+
+def style_chart(figure: go.Figure, height: int) -> go.Figure:
+    """Return the figure in the site's look: see-through background, page font, navy text and the series colors."""
+    figure.update_layout(
+        height=height,
+        paper_bgcolor="rgba(0, 0, 0, 0)",
+        plot_bgcolor="rgba(0, 0, 0, 0)",
+        font={"family": CHART_FONT, "color": CHART_TEXT_COLOR},
+        colorway=CHART_SERIES_COLORS,
+        margin={"l": 8, "r": 8, "t": 36, "b": 8},
+        legend={"orientation": "h", "x": 0, "y": 1.02, "yanchor": "bottom"},
+    )
+    figure.update_xaxes(showgrid=False, linecolor=CHART_GRID_COLOR)
+    figure.update_yaxes(
+        gridcolor=CHART_GRID_COLOR,
+        zeroline=False,
+        title_font={"color": CHART_MUTED_COLOR},
+    )
+    return figure
+
+
+def render_section_heading(key: str, title: str, description: str) -> None:
+    """Draw a shadcn heading with one muted line under it, the way Home heads its sections."""
+    with ui.elements(key=key) as heading:
+        heading.heading(title, level=4)
+        heading.text(description, variant="muted")
+
+
+def persona_limits_line(persona_key: str) -> str:
+    """Return the persona's limits and trading venue as one short line."""
+    persona = config.PERSONAS[persona_key]
+    return (
+        f"Sector cap {persona.sector_cap:.0%} · max {persona.max_position_pct:.0%} "
+        f"per stock · {persona.cash_buffer:.0%} cash buffer · "
+        f"{ACCOUNT_LABELS[persona.account]}"
+    )
+
+
 def holdings_rows(book: Book, marks: dict[str, float], equity: float) -> list[dict]:
     """Return one table row per held ticker: sector, shares, mark, value, weight and average cost."""
     rows = []
     for ticker, shares in sorted(book.shares.items()):
         value = shares * marks[ticker]
-        avg_cost = book.avg_cost.get(ticker)
         rows.append(
             {
-                "Ticker": ticker,
-                "Sector": config.SECTOR_BY_TICKER.get(ticker, "none"),
-                "Shares": shares,
-                "Price": round(marks[ticker], 2),
-                "Value": round(value, 2),
-                "Weight %": round(100 * value / equity, 1),
-                "Avg cost": None if avg_cost is None else round(avg_cost, 2),
+                "ticker": ticker,
+                "sector": config.SECTOR_BY_TICKER.get(ticker, "none"),
+                "shares": f"{shares:,}",
+                "price": format_money(marks[ticker]),
+                "value": format_money(value),
+                "weight": f"{value / equity:.1%}",
+                "avg_cost": format_money(book.avg_cost.get(ticker)),
             }
         )
 
@@ -1314,57 +1402,117 @@ def sector_chart(
     weights_by_series: dict[str, dict[str, float]],
     caps_key: str,
 ) -> go.Figure:
-    """Return grouped bars of sector weights (%) with a dashed line at the chosen persona's sector cap (S10)."""
+    """Return grouped sideways bars of sector weights (%) with a dashed line at the chosen persona's sector cap (S10)."""
     caps_persona = config.PERSONAS[caps_key]
 
+    # Sideways bars keep the sector names level in a half-width card.
     figure = go.Figure()
     for series_name, weights in weights_by_series.items():
         percents = [100 * weights[sector] for sector in config.SECTORS]
-        figure.add_bar(x=list(config.SECTORS), y=percents, name=series_name)
+        figure.add_bar(
+            x=percents,
+            y=list(config.SECTORS),
+            name=series_name,
+            orientation="h",
+        )
 
-    figure.add_hline(
-        y=100 * caps_persona.sector_cap,
+    figure.add_vline(
+        x=100 * caps_persona.sector_cap,
         line_dash="dash",
+        line_color=CHART_TEXT_COLOR,
         annotation_text=f"{caps_persona.display_name} cap {caps_persona.sector_cap:.0%}",
+        annotation_position="top",
+        annotation_font_color=CHART_MUTED_COLOR,
     )
     figure.update_layout(
         barmode="group",
-        yaxis_title="Weight (%)",
-        height=320,
+        xaxis_title="Weight (%)",
         showlegend=len(weights_by_series) > 1,
     )
+    style_chart(figure, height=380)
+    figure.update_xaxes(showgrid=True, gridcolor=CHART_GRID_COLOR)
+    figure.update_yaxes(showgrid=False, autorange="reversed")
     return figure
 
 
-def render_book(
-    persona_key: str,
-    book: Book,
-    marks: dict[str, float],
-    sector_weights: dict[str, float],
-) -> None:
-    """Show one persona's limits, NAV, cash, holdings and sector weights against its own cap (S10, story 38)."""
+def render_book_metrics(persona_key: str, book: Book, equity: float) -> None:
+    """Show the book's equity, cash, invested share and position count as shadcn metric cards."""
+    persona = config.PERSONAS[persona_key]
+    invested_pct = (equity - book.cash) / equity
+    held_count = len(book.shares)
+
+    equity_column, cash_column, invested_column, holdings_column = st.columns(4)
+    with equity_column:
+        ui.metric_card(
+            "Equity",
+            format_money(equity),
+            description="Cash plus holdings at the latest close",
+            key=f"equity_{persona_key}",
+        )
+    with cash_column:
+        ui.metric_card(
+            "Cash",
+            format_money(book.cash),
+            description=f"{book.cash / equity:.1%} of equity",
+            key=f"cash_{persona_key}",
+        )
+    with invested_column:
+        ui.metric_card(
+            "Invested",
+            f"{invested_pct:.1%}",
+            description=f"Sized to at most {persona.max_invested_pct:.0%}",
+            key=f"invested_{persona_key}",
+        )
+    with holdings_column:
+        ui.metric_card(
+            "Holdings",
+            held_count,
+            description="Stocks and sector ETFs",
+            key=f"held_{persona_key}",
+        )
+
+
+def render_book(persona_key: str, book: Book, marks: dict[str, float]) -> None:
+    """Show one persona's key numbers, sector weights against its own cap and holdings (S10, story 38)."""
     import portfolio
 
     persona = config.PERSONAS[persona_key]
     equity = portfolio.compute_book_equity(book, marks)
-    st.caption(
-        f"Sector cap {persona.sector_cap:.0%}, max per name "
-        f"{persona.max_position_pct:.0%}, cash buffer {persona.cash_buffer:.0%}"
-    )
-    nav_column, cash_column = st.columns(2)
-    nav_column.metric("NAV", f"${equity:,.0f}")
-    cash_column.metric("Cash", f"${book.cash:,.0f}")
+    render_book_metrics(persona_key, book, equity)
 
-    holdings_column, chart_column = st.columns(2)
-    with holdings_column:
-        holdings = holdings_rows(book, marks, equity)
-        if holdings:
-            st.dataframe(holdings, hide_index=True)
-        else:
-            st.caption("All cash: no positions yet.")
+    if not book.shares:
+        ui.alert(
+            "All cash: no positions yet.",
+            "Holdings and sector weights show here once orders fill.",
+            key=f"all_cash_{persona_key}",
+        )
+        return
+
+    chart_column, holdings_column = st.columns([5, 7])
     with chart_column:
-        figure = sector_chart({"Now": sector_weights}, persona_key)
-        st.plotly_chart(figure, key=f"sectors_{persona_key}")
+        with st.container(border=True, key=f"portfolio_card_sectors_{persona_key}"):
+            render_section_heading(
+                f"sectors_head_{persona_key}",
+                "Sector weights",
+                f"Each bar is a sector's share of equity; the dashed line is "
+                f"the {persona.sector_cap:.0%} cap.",
+            )
+            figure = sector_chart(
+                {"Now": portfolio.sector_weights(book, marks)}, persona_key
+            )
+            st.plotly_chart(figure, key=f"sectors_{persona_key}")
+    with holdings_column:
+        with st.container(border=True, key=f"portfolio_card_holdings_{persona_key}"):
+            render_section_heading(
+                f"holdings_head_{persona_key}",
+                "Holdings",
+                "Priced at the latest close; weight is the share of equity.",
+            )
+            ui.table(
+                holdings_rows(book, marks, equity),
+                HOLDINGS_COLUMNS,
+                key=f"holdings_{persona_key}",
+            )
 
 
 def preview_rebalance(
@@ -1432,7 +1580,7 @@ def render_rebalance_preview(
     if not result.orders:
         return
 
-    approve_clicked = st.button(
+    approve_clicked = ui.button(
         "Approve rebalance", key=f"approve_rebalance_{persona_key}"
     )
     caption_snaptrade_order_time({persona_key: result.orders})
@@ -1443,27 +1591,31 @@ def render_rebalance_preview(
 def rebalance_controls(persona_key: str, book: Book, marks: dict[str, float]) -> None:
     """Rebalance on demand, optionally against another persona's caps; the preview lives in the session (S8, R3)."""
     persona_keys = list(config.PERSONAS)
-    caps_key = st.selectbox(
-        "Check against caps of",
-        persona_keys,
-        index=persona_keys.index(persona_key),
-        format_func=display_name,
-        key=f"caps_{persona_key}",
-    )
     preview_key = f"rebalance_preview_{persona_key}"
     outcome_key = f"rebalance_outcome_{persona_key}"
-
     is_fred_missing = bool(missing_keys(FRED_KEY_ENV_VAR))
+
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        picked_caps_key = ui.select(
+            "Check against caps of",
+            persona_keys,
+            index=persona_keys.index(persona_key),
+            format_func=display_name,
+            key=f"caps_{persona_key}",
+            width=280,
+        )
+        # Kept in session_state: a button under another button's `if` never
+        # fires, because the outer button is False again on that rerun.
+        rebalance_clicked = ui.button(
+            "Rebalance",
+            key=f"rebalance_{persona_key}",
+            disabled=is_fred_missing,
+        )
     if is_fred_missing:
         st.caption(f"Rebalance needs {FRED_KEY_ENV_VAR} in .env.")
 
-    # Kept in session_state: a button under another button's `if` never
-    # fires, because the outer button is False again on that rerun.
-    rebalance_clicked = st.button(
-        "Rebalance",
-        key=f"rebalance_{persona_key}",
-        disabled=is_fred_missing,
-    )
+    # R3's selector defaults to the persona's own caps.
+    caps_key = picked_caps_key or persona_key
     if rebalance_clicked:
         st.session_state.pop(preview_key, None)
         st.session_state.pop(outcome_key, None)
@@ -1491,24 +1643,63 @@ def clear_rebalance_state() -> None:
         st.session_state.pop(f"rebalance_outcome_{persona_key}", None)
 
 
+def render_persona(persona_key: str, marks: dict[str, float]) -> None:
+    """Show one persona's book and its Rebalance card, or say why its book can't be shown."""
+    import books
+    import portfolio
+
+    persona = config.PERSONAS[persona_key]
+    with ui.elements(key=f"persona_head_{persona_key}") as heading:
+        heading.heading(persona.display_name, level=3)
+        heading.text(persona_limits_line(persona_key), variant="muted")
+
+    try:
+        book = books.current_book(persona_key)
+    except Exception as error:
+        show_live_error(f"Reading {persona.display_name}'s book", error)
+        return
+
+    # Tickers from an older universe have no mark to value them by.
+    stale_tickers = portfolio.tickers_outside_universe(book)
+    if stale_tickers:
+        st.caption(
+            f"Holds {', '.join(stale_tickers)} from the old stock universe; "
+            "Reset books below re-seeds it."
+        )
+        return
+
+    render_book(persona_key, book, marks)
+    with st.container(border=True, key=f"portfolio_card_rebalance_{persona_key}"):
+        render_section_heading(
+            f"rebalance_head_{persona_key}", "Rebalance", REBALANCE_NOTE
+        )
+        rebalance_controls(persona_key, book, marks)
+
+
 def render_sandbox(rows: list[dict]) -> None:
     """Show the SnapTrade Sandbox's demo holdings on their own; they never join a persona's book (S16, story 59)."""
-    st.caption(
-        "Pre-filled demo holdings from SnapTrade's read-only Sandbox. "
-        "They are not part of any persona's book."
-    )
     if not rows:
         st.caption("The Sandbox account holds nothing.")
         return
 
-    st.dataframe(rows, hide_index=True)
+    table_rows = []
+    for row in rows:
+        table_rows.append(
+            {
+                "ticker": row["ticker"],
+                "units": format_quantity(row["units"]),
+                "price": format_money(row["price"]),
+                "cost_basis": format_money(row["cost_basis"]),
+            }
+        )
+    ui.table(table_rows, SANDBOX_COLUMNS, key="sandbox_holdings")
 
 
 def sandbox_panel() -> None:
     """Read the Sandbox holdings through the shared 60 s SnapTrade cache and show them, or say why not."""
     import brokerage
 
-    st.subheader("SnapTrade Sandbox")
+    render_section_heading("sandbox_head", "SnapTrade Sandbox", SANDBOX_NOTE)
     if not brokerage.is_sandbox_configured():
         st.caption(SANDBOX_SETUP_NOTE)
         return
@@ -1524,22 +1715,29 @@ def sandbox_panel() -> None:
 
 def reset_books_control() -> None:
     """Clear the simulator fill logs and re-seed the opening books, for a clean rehearsal (S16, story 58)."""
+    import books
     import execute
 
-    st.subheader("Reset books")
+    seeded_names = " and ".join(display_name(key) for key in books.SEED_PERSONAS)
+    render_section_heading(
+        "reset_head",
+        "Reset books",
+        f"Re-seeds the {seeded_names} books at Friday's close, for a clean rehearsal.",
+    )
     if st.session_state.pop("books_reset", False):
-        st.success("Simulator books cleared and re-seeded.")
+        ui.alert("Simulator books cleared and re-seeded.", key="books_reset_done")
 
     is_fred_missing = bool(missing_keys(FRED_KEY_ENV_VAR))
     if is_fred_missing:
         st.caption(f"Reset books needs {FRED_KEY_ENV_VAR} in .env to re-seed.")
 
-    confirmed = st.checkbox(
+    confirmed = ui.checkbox(
         "Clear the simulator fill logs and re-seed the opening books",
         key="confirm_reset",
     )
-    reset_clicked = st.button(
+    reset_clicked = ui.button(
         "Reset books",
+        variant="destructive",
         disabled=is_fred_missing or not confirmed,
         key="reset_books",
     )
@@ -1558,35 +1756,21 @@ def reset_books_control() -> None:
 
 
 def portfolio_tab() -> None:
-    """Per-persona holdings and sector charts with Rebalance, then the Sandbox panel and Reset books."""
-    import books
-    import portfolio
+    """One persona at a time: its book, sector chart and Rebalance; then the Sandbox and Reset books."""
     import prices
 
-    marks = prices.latest_marks()
-    for persona_key, persona in config.PERSONAS.items():
-        st.subheader(persona.display_name)
-        try:
-            book = books.current_book(persona_key)
-        except Exception as error:
-            show_live_error(f"Reading {persona.display_name}'s book", error)
-            continue
+    persona_key = ui.tabs(
+        list(config.PERSONAS),
+        format_func=display_name,
+        key="portfolio_persona",
+        width="content",
+    )
+    render_persona(persona_key, prices.latest_marks())
 
-        # Tickers from an older universe have no mark to value them by.
-        stale_tickers = portfolio.tickers_outside_universe(book)
-        if stale_tickers:
-            st.caption(
-                f"Holds {', '.join(stale_tickers)} from the old stock universe; "
-                "Reset books below re-seeds it."
-            )
-            continue
-
-        weights_by_sector = portfolio.sector_weights(book, marks)
-        render_book(persona_key, book, marks, weights_by_sector)
-        rebalance_controls(persona_key, book, marks)
-
-    sandbox_panel()
-    reset_books_control()
+    with st.container(border=True, key="portfolio_card_sandbox"):
+        sandbox_panel()
+    with st.container(border=True, key="portfolio_card_reset"):
+        reset_books_control()
 
 
 def normalized(values: list[float]) -> list[float]:
@@ -1612,12 +1796,6 @@ def forward_test_tab() -> None:
         )
         return
 
-    first_run_day = runs[0]["taken_at"][:10]
-    st.caption(
-        f"Forward test started today ({first_run_day}). Weekend runs are marked "
-        "at Friday's close, so the lines start flat."
-    )
-
     run_times = [run["taken_at"] for run in runs]
     figure = go.Figure()
     for persona_key, persona in config.PERSONAS.items():
@@ -1635,10 +1813,16 @@ def forward_test_tab() -> None:
         y=normalized(spy_closes),
         name=config.BENCHMARK,
         mode="lines+markers",
-        line={"color": "gray", "dash": "dash"},
+        line=BENCHMARK_LINE,
     )
-    figure.update_layout(yaxis_title="Value (first run = 100)", height=420)
-    st.plotly_chart(figure, key="forward_test")
+    figure.update_layout(yaxis_title="Value (first run = 100)")
+    st.plotly_chart(style_chart(figure, height=420), key="forward_test")
+
+    first_run_day = runs[0]["taken_at"][:10]
+    st.caption(
+        f"Forward test started today ({first_run_day}). Weekend runs are marked "
+        "at Friday's close, so the lines start flat."
+    )
 
 
 def backtest_metric_rows(metrics_by_curve: dict[str, dict[str, float]]) -> list[dict]:
@@ -1647,12 +1831,12 @@ def backtest_metric_rows(metrics_by_curve: dict[str, dict[str, float]]) -> list[
     for curve_name, metrics in metrics_by_curve.items():
         rows.append(
             {
-                "Curve": curve_name,
-                "Total return": f"{metrics['total_return']:.1%}",
-                "Annualized return": f"{metrics['annualized_return']:.1%}",
-                "Sharpe": f"{metrics['sharpe']:.2f}",
-                "Max drawdown": f"{metrics['max_drawdown']:.1%}",
-                "Excess vs SPY": f"{metrics['excess_return_vs_spy']:+.1%}",
+                "curve": curve_name,
+                "total_return": f"{metrics['total_return']:.1%}",
+                "annualized_return": f"{metrics['annualized_return']:.1%}",
+                "sharpe": f"{metrics['sharpe']:.2f}",
+                "max_drawdown": f"{metrics['max_drawdown']:.1%}",
+                "excess_return": f"{metrics['excess_return_vs_spy']:+.1%}",
             }
         )
 
@@ -1666,6 +1850,27 @@ def backtest_tab() -> None:
         return
 
     results = json.loads(config.BACKTEST_RESULTS_PATH.read_text())
+    figure = go.Figure()
+    for curve_name, growth in results["growth"].items():
+        line_style = None
+        if curve_name == config.BENCHMARK:
+            line_style = BENCHMARK_LINE
+
+        figure.add_scatter(
+            x=results["dates"],
+            y=normalized(growth),
+            name=curve_name,
+            mode="lines",
+            line=line_style,
+        )
+    figure.update_layout(yaxis_title="Value (start = 100)", hovermode="x unified")
+    st.plotly_chart(style_chart(figure, height=420), key="backtest")
+    ui.table(
+        backtest_metric_rows(results["metrics"]),
+        BACKTEST_COLUMNS,
+        key="backtest_metrics",
+    )
+
     max_name_weight = config.PERSONAS["balanced"].max_position_pct
     st.caption(
         "Deterministic, no AI: every Monday the names with a positive technical "
@@ -1684,27 +1889,6 @@ def backtest_tab() -> None:
         "look like staying fully invested. FRED's high-yield spread history only "
         "starts in 2023, so there is no 2020 or 2022 stress test."
     )
-
-    figure = go.Figure()
-    for curve_name, growth in results["growth"].items():
-        line_style = None
-        if curve_name == config.BENCHMARK:
-            line_style = {"color": "gray", "dash": "dash"}
-
-        figure.add_scatter(
-            x=results["dates"],
-            y=normalized(growth),
-            name=curve_name,
-            mode="lines",
-            line=line_style,
-        )
-    figure.update_layout(
-        yaxis_title="Value (start = 100)",
-        hovermode="x unified",
-        height=420,
-    )
-    st.plotly_chart(figure, key="backtest")
-    st.dataframe(backtest_metric_rows(results["metrics"]), hide_index=True)
 
 
 def format_long_date(timestamp: str | None) -> str:
