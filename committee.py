@@ -228,7 +228,8 @@ MACRO_PROMPT = (
 PM_PROMPT = (
     "You are the Portfolio Manager on an investment committee. You are given "
     "each ticker's technical score, sentiment score, blended conviction, the "
-    "market-level Fear & Greed tilt already folded into that conviction and "
+    "market-level Fear & Greed tilt and each stock's fundamentals tilt "
+    "(forward P/E and debt), both already folded into that conviction, and "
     "the current regime. Write a short memo on the overall stance. You may "
     "drop a name the book should not hold, with a stated reason: a drop sets "
     "its target to zero and sells any shares held. You can never add a name "
