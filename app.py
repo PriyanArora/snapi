@@ -766,6 +766,51 @@ def portfolio_tab() -> None:
     reset_books_control()
 
 
+def normalized(values: list[float]) -> list[float]:
+    """Return the series rescaled so its first value is 100."""
+    return [100 * value / values[0] for value in values]
+
+
+def forward_test_tab() -> None:
+    """Plot NAV per persona and SPY from the run log, normalized to the first logged run (S14, F23, stories 44-45)."""
+    run_records = read_jsonl(config.RUN_LOG_PATH)
+    runs = [record for record in run_records if record["kind"] == "run"]
+    if not runs:
+        st.info(
+            "The forward test starts with the first Run swarm: "
+            "every run logs each persona's NAV."
+        )
+        return
+
+    first_run_day = runs[0]["taken_at"][:10]
+    st.caption(
+        f"Forward test started today ({first_run_day}). Weekend runs are marked "
+        "at Friday's close, so the lines start flat."
+    )
+
+    run_times = [run["taken_at"] for run in runs]
+    figure = go.Figure()
+    for persona_key, persona in config.PERSONAS.items():
+        navs = [run["nav"][persona_key] for run in runs]
+        figure.add_scatter(
+            x=run_times,
+            y=normalized(navs),
+            name=persona.display_name,
+            mode="lines+markers",
+        )
+
+    spy_closes = [run["spy_close"] for run in runs]
+    figure.add_scatter(
+        x=run_times,
+        y=normalized(spy_closes),
+        name=config.BENCHMARK,
+        mode="lines+markers",
+        line={"color": "gray", "dash": "dash"},
+    )
+    figure.update_layout(yaxis_title="Value (first run = 100)", height=420)
+    st.plotly_chart(figure, key="forward_test")
+
+
 def main() -> None:
     """Render the gated app; tabs follow the Q12 demo narrative."""
     st.set_page_config(page_title="snapi", layout="wide")
@@ -773,11 +818,15 @@ def main() -> None:
     check_password()
     prepare_live_books()
 
-    committee_area, portfolio_area = st.tabs(["Committee", "Portfolio"])
+    committee_area, portfolio_area, forward_test_area = st.tabs(
+        ["Committee", "Portfolio", "Forward test"]
+    )
     with committee_area:
         committee_tab()
     with portfolio_area:
         portfolio_tab()
+    with forward_test_area:
+        forward_test_tab()
 
 
 if __name__ == "__main__":
