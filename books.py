@@ -1,4 +1,4 @@
-"""Persona books, the per-cycle snapshot and the run log (PRD Execution, S14, S16, R7, R9).
+"""Persona books, the per-cycle snapshot and the run log (PRD Execution, S14, S16, R9).
 
 Conservative and Aggressive live in a fill log each (`data/fills_<persona>.jsonl`),
 rebuilt at start-up by replaying the fills into a fresh SimBroker; no
@@ -24,7 +24,7 @@ from committee import Proposal, Snapshot
 from config import BENCHMARK, DATA_DIR, PERSONAS, RUN_LOG_PATH, UNIVERSE, Regime
 from external.broker_models import Fill, Order
 from external.sim import SimBroker
-from portfolio import Book, compute_book_equity, sector_weights
+from portfolio import Book, compute_book_equity
 
 FillTag = Literal["committee", "rebalance", "seed"]
 
@@ -44,14 +44,11 @@ class FillRecord(BaseModel):
 
 
 class RunRecord(BaseModel):
-    """One Run swarm: the proposal plus each persona's book, sector weights and NAV (F23, R7)."""
+    """One Run swarm: the proposal plus each persona's NAV and SPY's close (F23)."""
 
     kind: Literal["run"] = "run"
     taken_at: datetime
     proposal: Proposal
-    marks: dict[str, float]
-    books: dict[str, Book]
-    sector_weights: dict[str, dict[str, float]]
     nav: dict[str, float]
     spy_close: float
 
@@ -238,7 +235,7 @@ def take_snapshot() -> Snapshot:
 
 
 def append_run_log(record: RunRecord | ApprovalRecord) -> None:
-    """Append one record to the run log that the forward test and the Cloud replay read (R7)."""
+    """Append one record to the run log that the forward test reads."""
     RUN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with RUN_LOG_PATH.open("a") as run_log:
         run_log.write(record.model_dump_json() + "\n")
@@ -247,17 +244,12 @@ def append_run_log(record: RunRecord | ApprovalRecord) -> None:
 def log_run(snapshot: Snapshot, proposal: Proposal) -> RunRecord:
     """Record one Run swarm with each persona's NAV and SPY's close, then return it (F23, S14, story 44)."""
     nav = {}
-    weights_by_sector = {}
     for persona_key, book in snapshot.books.items():
         nav[persona_key] = compute_book_equity(book, snapshot.marks)
-        weights_by_sector[persona_key] = sector_weights(book, snapshot.marks)
 
     record = RunRecord(
         taken_at=snapshot.taken_at,
         proposal=proposal,
-        marks=snapshot.marks,
-        books=snapshot.books,
-        sector_weights=weights_by_sector,
         nav=nav,
         spy_close=snapshot.marks[BENCHMARK],
     )
