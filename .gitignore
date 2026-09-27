@@ -16,3 +16,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .cache/
+
+# Runtime logs from the live app (fill logs, run log); local state, not committed
+data/*.jsonl

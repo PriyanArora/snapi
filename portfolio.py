@@ -9,7 +9,7 @@ caller decides what "target weights" means, this function only enforces
 the caps and diversifies whatever it is handed. `size_persona` runs the
 full chain — blend, Fear & Greed tilt, PM drops, per-name max, then
 `rebalance` — and is called by the committee's size node (preview) and
-again by `execute` against a fresh snapshot (Phase3).
+again by `execute` against a fresh snapshot.
 """
 
 from __future__ import annotations
@@ -89,18 +89,14 @@ def _carry_forward_held_etfs(
     target_weights: dict[str, float],
     book: Book,
 ) -> dict[str, float]:
-    """Add any bucket ETF the book still holds but that `target_weights` left out.
-
-    Carried at weight 0.0, not at the ETF's current weight: `build_orders`
-    closes any name missing from the targets, so the ETF still needs an
-    entry here, but the refill pool (sized off invested %, not off this
-    dict) re-derives its real weight every cycle. Carrying the current
-    weight instead would stack a fresh refill on top of it each cycle and
-    push gross past invested % (Sizing chain steps 3-4).
-    """
+    """Return `target_weights` plus, at weight 0.0, any bucket ETF the book holds but the targets left out."""
     bucket_etfs = set(config.ETF_BY_SECTOR.values())
     carried = dict(target_weights)
 
+    # `build_orders` closes any name missing from the targets, so a held ETF
+    # needs an entry; the Q9 refill then re-derives its real weight. Carrying
+    # its current weight instead would stack a fresh refill on top every
+    # cycle and push gross past invested % (sizing chain steps 3-4).
     for ticker in book.shares:
         if ticker in carried or ticker not in bucket_etfs:
             continue
@@ -139,12 +135,10 @@ def _refill_underweight_etfs(
     equal_weight_target: float,
     sector_cap: float,
 ) -> dict[str, float]:
-    """Spend `refill_pool` on the most-underweight buckets' ETFs (F6, Q9).
+    """Return `weights` with `refill_pool` spent on the most-underweight buckets' ETFs (F6, Q9).
 
-    A bucket is underweight when it sits below the equal-weight target.
-    Each underweight bucket's ETF is topped up to the lesser of that target
-    and the sector cap, most-underweight bucket first; whatever the pool
-    can't cover stays in cash.
+    Each bucket below the equal-weight target has its ETF topped up to the
+    lesser of that target and the cap; whatever the pool can't cover stays in cash.
     """
     filled = dict(weights)
     remaining_pool = refill_pool
@@ -255,24 +249,10 @@ def build_orders_for_targets(
     caps_persona: config.Persona,
     invested_pct: float,
 ) -> list[Order]:
-    """Return whole-share orders that move `book` to `target_weights` (sizing chain steps 4-5).
+    """Return whole-share orders that move `book` to `target_weights`, minus trades under $200 (sizing chain steps 4-5).
 
-    Builds orders with `build_orders`, then drops any order under
-    `config.MIN_TRADE_USD` (F11) -- except a sell whose sector is still
-    over `caps_persona.sector_cap` once every kept order fills. That sell
-    is kept even under $200, because the hard cap (F7) outranks the trade
-    floor; the exemption is decided on the post-trade book, not the
-    pre-trade one, so a same-sector buy can't push a capped sector over
-    while its own dropped sell sits on paper (PRD "What changed during
-    build" row 7).
-
-    If the floored book still breaks a per-name max, a sector cap or the
-    cash buffer, every dropped sell is restored: a sell only ever moves
-    the book toward `target_weights`, which already satisfies every limit,
-    so restoring it can't create a new breach (deviation #7's own logic,
-    extended to F10 and F11's cash buffer). Shared by `rebalance` (preview)
-    and `execute.execute` (fresh re-derivation) so both size orders the
-    same way.
+    Shared by `rebalance` (preview) and `execute` (fresh re-derivation), so
+    both size orders the same way.
     """
     equity = compute_book_equity(book, marks)
 
@@ -286,6 +266,10 @@ def build_orders_for_targets(
         equity * (1 + SHARE_ROUNDING_TOLERANCE),
     )
 
+    # A sub-$200 sell stays when its sector is still over the cap once every
+    # kept order fills: the hard cap (F7) outranks the floor (F11). Judged on
+    # the post-trade book, so a same-sector buy can't push a capped sector
+    # over while its own dropped sell sits on paper (build deviation #7).
     large_enough_orders = [order for order in orders if _is_large_enough(order)]
     post_sector_weights = _sector_totals(
         _weights_after_orders(book, large_enough_orders, marks, equity)
@@ -305,6 +289,9 @@ def build_orders_for_targets(
         if _is_large_enough(order) or restores_cap:
             floored_orders.append(order)
 
+    # Still breaking a per-name max, a cap or the cash buffer: restore every
+    # dropped sell. A sell only moves the book toward targets that already
+    # meet every limit, so it can't create a new breach (build deviation #14).
     if _breaks_a_limit(book, floored_orders, marks, equity, caps_persona, invested_pct):
         return [
             order for order in orders if order.side == "sell" or _is_large_enough(order)
@@ -321,21 +308,10 @@ def rebalance(
     invested_pct: float,
     caps_persona: config.Persona | None = None,
 ) -> RebalanceResult:
-    """Trim over-cap sectors and refill underweight ETFs (F7, F8, F6, Q9, S8).
+    """Return the capped targets, their whole-share orders and before/after sector weights (F5-F8, Q9, S8).
 
-    `target_weights` is the proposal to enforce caps on: the sized weights
-    for the automatic cycle, or `weights_by_ticker(book, marks)` for the
-    Rebalance button. `invested_pct` is the persona's target invested % at
-    the current regime (`persona.invested_pct_for_regime(regime)`): Q9's
-    equal-weight target is `invested_pct / 7`, and the refill pool is
-    whatever of `invested_pct` the sector trims and per-name clamps left
-    unallocated — so gross can never grow past `invested_pct`. `caps_persona`
-    lets a book be checked against a stricter persona's caps (R3); it
-    defaults to `persona`.
-
-    Builds whole-share orders through `build_orders_for_targets`, which drops
-    trades under `config.MIN_TRADE_USD` except cap-restoring sells
-    (F11, F7, sizing chain steps 4-5).
+    `target_weights` is the sized proposal (cycle) or the book's own weights
+    (Rebalance button); `caps_persona` checks against another persona's caps (R3).
     """
     caps_persona = caps_persona or persona
     before_sector_weights = sector_weights(book, marks)
@@ -343,6 +319,8 @@ def rebalance(
     working_weights = _carry_forward_held_etfs(target_weights, book)
     equal_weight_target = invested_pct / len(config.SECTORS)
 
+    # Q9: the pool is whatever of the regime's invested % the trims and
+    # per-name clamps left unallocated, so gross never grows past it.
     trimmed_weights = _trim_over_cap_sectors(working_weights, caps_persona.sector_cap)
     refill_pool = max(0.0, invested_pct - sum(trimmed_weights.values()))
     final_weights = _refill_underweight_etfs(

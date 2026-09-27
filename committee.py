@@ -7,9 +7,9 @@ analyst owns its own state key and is wrapped so a failure abstains instead
 of discarding the whole run (story 9) -- a LangGraph superstep is
 transactional, so one failing branch would otherwise cancel the others.
 
-`run_committee(snapshot) -> proposal` is the entry point for tests and for
-`books.take_snapshot` + Approve; `app.py` instead streams `build_graph()` in
-"updates" mode and calls `build_proposal` on the merged result.
+`run_committee(snapshot) -> proposal` is the PRD's entry point (seam 1);
+`app.py` instead streams `build_graph()` in "updates" mode, so each card
+fills as its node finishes, and calls `build_proposal` on the merged result.
 """
 
 from __future__ import annotations
@@ -165,9 +165,8 @@ class CriticNotes(BaseModel):
     notes: str
 
 
-# Sentiment, Technical, Macro, PM, Critic (in that order, over one-paragraph
-# placeholder text). The finance teammate owns the wording; this is a
-# deliberate placeholder kept in one obvious place.
+# The five agent prompts, in graph order. The finance teammate owns the
+# wording; these one-paragraph drafts stay here, in one obvious place.
 SENTIMENT_PROMPT = (
     "You are the Sentiment analyst on an investment committee. For every "
     "ticker you are shown, read its recent headlines (and any Alpha Vantage "
@@ -291,18 +290,19 @@ def _news_prompt(news: dict[str, TickerNews]) -> str:
 
 def sentiment_node(state: CommitteeState) -> dict[str, Report]:
     """Sentiment analyst: the LLM scores each ticker's news; scores are clipped to [-1, 1] in code."""
-    answer = ask(
-        "sentiment",
-        SENTIMENT_PROMPT,
-        _news_prompt(state["snapshot"].news),
-        SentimentAnswer,
-    )
+    news = state["snapshot"].news
+    answer = ask("sentiment", SENTIMENT_PROMPT, _news_prompt(news), SentimentAnswer)
+    tickers_with_headlines = {
+        ticker for ticker, ticker_news in news.items() if ticker_news.articles
+    }
 
     scores = {}
     reasons = {}
     for view in answer.views:
         if view.ticker not in config.UNIVERSE:
             continue  # only the universe it was shown can be scored
+        if view.ticker not in tickers_with_headlines:
+            continue  # a score with no headlines is invented; technical stands alone
         scores[view.ticker] = max(-1.0, min(1.0, view.score))
         reasons[view.ticker] = view.why
 
@@ -397,6 +397,7 @@ def _abstain_on_error(
     """
 
     def run_or_abstain(state: CommitteeState) -> dict:
+        """Return the analyst's update, or its abstained report when it raises."""
         try:
             return node(state)
         except Exception as error:
