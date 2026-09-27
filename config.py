@@ -241,6 +241,8 @@ RUN_LOG_PATH = DATA_DIR / "run_log.jsonl"
 # The latest Sonnet run, kept so the UI can fall back to it when a live run
 # fails or is too slow.
 SONNET_RUNS_PATH = DATA_DIR / "sonnet_runs.jsonl"
+# The Chat page's saved conversations, listed under Recent chats.
+CHATS_PATH = DATA_DIR / "chats.jsonl"
 
 # P1 backtest output (S15): backtest.py writes it, the Backtest tab reads it.
 BACKTEST_RESULTS_PATH = DATA_DIR / "backtest_results.json"

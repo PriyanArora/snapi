@@ -35,6 +35,7 @@ import signals
 from committee import Proposal, Snapshot
 from config import (
     BENCHMARK,
+    CHATS_PATH,
     DATA_DIR,
     PERSONAS,
     RUN_LOG_PATH,
@@ -385,3 +386,36 @@ def latest_sonnet_run() -> dict | None:
         return None
 
     return saved_runs[-1]
+
+
+def save_chat(chat: dict) -> None:
+    """Save a Chat page conversation, replacing the earlier version with the same chat_id."""
+    collection = _log_collection(CHATS_PATH)
+    if collection is not None:
+        collection.replace_one({"chat_id": chat["chat_id"]}, chat, upsert=True)
+        return
+
+    # A JSONL file can't replace a line, so each save appends and
+    # recent_chats keeps the last version per chat_id.
+    CHATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with CHATS_PATH.open("a") as chat_log:
+        chat_log.write(json.dumps(chat) + "\n")
+
+
+def recent_chats(limit: int = 10) -> list[dict]:
+    """Return the latest saved conversations as plain JSON dicts, the most recently updated first."""
+    collection = _log_collection(CHATS_PATH)
+    if collection is not None:
+        newest_first = collection.find({}, {"_id": False}).sort("updated_at", -1)
+        return list(newest_first.limit(limit))
+
+    latest_by_chat_id = {}
+    for chat in _read_log(CHATS_PATH):
+        latest_by_chat_id[chat["chat_id"]] = chat
+
+    newest_first = sorted(
+        latest_by_chat_id.values(),
+        key=lambda chat: chat["updated_at"],
+        reverse=True,
+    )
+    return newest_first[:limit]
