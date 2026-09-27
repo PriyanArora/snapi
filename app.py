@@ -45,60 +45,45 @@ APP_PASSWORD_ENV_VAR = "APP_PASSWORD"
 
 TAGLINE = "Turn your brokerage into your own AI hedge fund"
 LOGIN_CARD_WIDTH = 400
-# The logo's dot-matrix font echoes the login page's pixel background.
+# The page font comes from .streamlit/config.toml. shadcn sets its own font on
+# its component root, so the host inherits the page font instead.
+SITE_CSS = "<style>[data-ssui-v2-host] { font-family: inherit; }</style>"
 LOGO_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Doto:wght@900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@1,800&display=swap');
 .snapi-logo {
-  font-family: 'Doto', monospace;
-  font-weight: 900;
-  font-size: 4.5rem;
+  font-family: 'Playfair Display', serif;
+  font-style: italic;
+  font-weight: 800;
+  font-size: 5rem;
   line-height: 1;
+  letter-spacing: -0.02em;
   text-align: center;
-  color: #fff;
-  text-shadow: 0 0 22px rgba(255, 45, 150, 0.75), 0 0 2px rgba(255, 170, 215, 0.9);
+  color: #0F1B3D;
 }
 """
-# Login background: pink film grain, neon glows, and a pixel field that
-# fades out upward. The SVGs are URL-encoded below because Streamlit's HTML
-# sanitizer drops a <style> block that holds raw <svg> tags.
+# Login background: soft grain over blue-teal glows on the off-white page.
+# The SVG is URL-encoded because Streamlit's HTML sanitizer drops a <style>
+# block that holds a raw <svg> tag.
 GRAIN_SVG = (
     "<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'>"
     "<filter id='g'><feTurbulence type='fractalNoise' baseFrequency='.8' "
     "numOctaves='2' stitchTiles='stitch'/>"
-    "<feColorMatrix values='0 0 0 0 1  0 0 0 0 .45  0 0 0 0 .8  1.6 0 0 0 -1.05'/>"
+    "<feColorMatrix values='0 0 0 0 .25  0 0 0 0 .4  0 0 0 0 .45  1.5 0 0 0 -1'/>"
     "</filter><rect width='100%' height='100%' filter='url(#g)'/></svg>"
-)
-# Pixelate: sample the noise once per 12px cell, then grow each sample into a square.
-PIXEL_SVG = (
-    "<svg xmlns='http://www.w3.org/2000/svg' width='640' height='640'>"
-    "<filter id='p' x='0' y='0' width='100%' height='100%'>"
-    "<feTurbulence type='fractalNoise' baseFrequency='.9' seed='4' "
-    "stitchTiles='stitch' result='noise'/>"
-    "<feFlood x='5' y='5' width='2' height='2'/>"
-    "<feComposite width='12' height='12'/><feTile result='samples'/>"
-    "<feComposite in='noise' in2='samples' operator='in'/>"
-    "<feMorphology operator='dilate' radius='4'/>"
-    "<feColorMatrix values='0 0 0 0 1  0 0 0 0 .2  0 0 0 0 .6  3 0 0 0 -1.8'/>"
-    "</filter><rect width='100%' height='100%' filter='url(#p)'/></svg>"
 )
 LOGIN_PAGE_CSS = f"""
 <style>
 .stApp {{
-  background-color: #060307;
+  background-color: #F4F6F8;
   background-image:
     url("data:image/svg+xml,{quote(GRAIN_SVG)}"),
-    radial-gradient(55% 50% at 8% 108%, rgba(255, 45, 150, 0.45), transparent 70%),
-    radial-gradient(40% 38% at 96% -6%, rgba(255, 45, 150, 0.22), transparent 70%),
-    radial-gradient(38% 32% at 82% 96%, rgba(170, 60, 255, 0.14), transparent 70%),
-    linear-gradient(to bottom, #060307 0%, #060307 48%, rgba(6, 3, 7, 0.35) 78%, rgba(6, 3, 7, 0) 100%),
-    url("data:image/svg+xml,{quote(PIXEL_SVG)}");
-  background-size: 240px 240px, 100% 100%, 100% 100%, 100% 100%, 100% 100%, 640px 640px;
+    radial-gradient(75% 70% at 0% 0%, rgba(159, 193, 193, 1), transparent 72%),
+    radial-gradient(70% 65% at 100% 100%, rgba(159, 193, 193, 0.95), transparent 72%),
+    radial-gradient(45% 45% at 100% 0%, rgba(130, 165, 195, 0.5), transparent 70%);
+  background-size: 240px 240px, 100% 100%, 100% 100%, 100% 100%;
   background-attachment: fixed;
 }}
-/* shadcn picks light or dark from the host's Streamlit background, so a
-   dark value here gives the login card shadcn's dark theme. */
-.stApp [data-testid="stBidiComponentIsolated"] {{ --st-background-color: #060307; }}
-header[data-testid="stHeader"] {{ display: none; }}
+header[data-testid="stHeader"] {{ background: transparent; }}
 [data-testid="stMainBlockContainer"] {{ padding-top: 14vh; }}
 </style>
 """
@@ -215,7 +200,7 @@ def is_password_correct(entered_password: str) -> bool:
 
 
 def render_logo() -> None:
-    """Draw the Snapi wordmark in its dot-matrix logo font."""
+    """Draw the Snapi wordmark in its serif italic logo font."""
     st.html(f'<style>{LOGO_CSS}</style><div class="snapi-logo">Snapi</div>')
 
 
@@ -1291,6 +1276,7 @@ def chat_tab() -> None:
 def main() -> None:
     """Render the gated app; tabs follow the Q12 demo narrative."""
     st.set_page_config(page_title="snapi", layout="wide")
+    st.html(SITE_CSS)
     # Cloud's root-level Secrets reach os.environ only once st.secrets is
     # parsed. `streamlit run` parses it at start-up; this covers any other
     # start (AppTest) and is a no-op without a secrets file.
