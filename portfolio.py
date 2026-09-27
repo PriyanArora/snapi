@@ -1,12 +1,15 @@
-"""Portfolio state and the sector-cap rebalance layer.
+"""Portfolio state and the sizing chain (PRD "Sizing chain").
 
-`Book` is the plain state a persona holds; `rebalance` is the one pure
-function that enforces the sector caps (F5, F7) and refills freed weight
-into underweight buckets (F6, Q9). It is used both by the automatic sizing
+`Book` is the plain state a persona holds. `rebalance` is the pure function
+that enforces the sector caps (F5, F7) and refills freed weight into
+underweight buckets (F6, Q9); it is used both by the automatic sizing
 chain (step 3, called with the sized target weights) and by the Rebalance
 button (called with the book's own current weights, S8/user story 30) — the
 caller decides what "target weights" means, this function only enforces
-the caps and diversifies whatever it is handed.
+the caps and diversifies whatever it is handed. `size_persona` runs the
+full chain — blend, Fear & Greed tilt, PM drops, per-name max, then
+`rebalance` — and is called by the committee's size node (preview) and
+again by `execute` against a fresh snapshot (Phase3).
 """
 
 from __future__ import annotations
@@ -15,9 +18,19 @@ from dataclasses import dataclass
 
 import config
 from external.broker_models import Order, Position
+from external.construction import blend_signals
 from external.execution import build_orders
+from external.limits import RiskLimits, apply_limits
+from external.models import Signal
 
 SHARE_ROUNDING_TOLERANCE = 1e-9
+
+# F12 blend weights and the long-only permission for both analysts.
+MODEL_WEIGHTS = {
+    "technical": config.TECHNICAL_WEIGHT,
+    "sentiment": config.SENTIMENT_WEIGHT,
+}
+LONG_ONLY_APPROACHES = {"technical": "long_only", "sentiment": "long_only"}
 
 
 @dataclass(frozen=True)
@@ -39,7 +52,7 @@ class RebalanceResult:
     after_sector_weights: dict[str, float]
 
 
-def _equity(book: Book, marks: dict[str, float]) -> float:
+def book_equity(book: Book, marks: dict[str, float]) -> float:
     """Total book value: cash plus every position marked at its current price."""
     positions_value = sum(
         shares * marks[ticker] for ticker, shares in book.shares.items()
@@ -49,7 +62,7 @@ def _equity(book: Book, marks: dict[str, float]) -> float:
 
 def weights_by_ticker(book: Book, marks: dict[str, float]) -> dict[str, float]:
     """Return each held ticker's weight, as a fraction of the book's equity."""
-    equity = _equity(book, marks)
+    equity = book_equity(book, marks)
     return {
         ticker: shares * marks[ticker] / equity
         for ticker, shares in book.shares.items()
@@ -196,6 +209,53 @@ def _weights_after_orders(
     }
 
 
+def orders_for_targets(
+    book: Book,
+    target_weights: dict[str, float],
+    marks: dict[str, float],
+    sector_cap: float,
+) -> list[Order]:
+    """Return whole-share orders that move `book` to `target_weights` (sizing chain steps 4-5).
+
+    Builds orders with `build_orders`, then drops any order under
+    `config.MIN_TRADE_USD` (F11) — except a sell in a sector that is
+    currently over `sector_cap`. That sell is kept even under $200,
+    because the hard cap (F7) outranks the trade floor (F11); see PRD
+    "What changed during build" row 7. Shared by `rebalance` (preview) and
+    `execute.execute` (fresh re-derivation) so both size orders the same
+    way.
+    """
+    equity = book_equity(book, marks)
+
+    # Absorbs float round-trip error (e.g. weight*equity/mark landing a hair
+    # under a held share count) before build_orders floors shares, so a
+    # target equal to the current weight never emits a spurious 1-share sell.
+    orders = build_orders(
+        target_weights,
+        _positions(book),
+        marks,
+        equity * (1 + SHARE_ROUNDING_TOLERANCE),
+    )
+
+    over_cap_sectors = {
+        sector
+        for sector, weight in sector_weights(book, marks).items()
+        if weight > sector_cap
+    }
+
+    kept_orders = []
+    for order in orders:
+        is_large_enough = order.price * order.quantity >= config.MIN_TRADE_USD
+        restores_cap = (
+            order.side == "sell"
+            and config.SECTOR_BY_TICKER.get(order.ticker) in over_cap_sectors
+        )
+        if is_large_enough or restores_cap:
+            kept_orders.append(order)
+
+    return kept_orders
+
+
 def rebalance(
     book: Book,
     persona: config.Persona,
@@ -216,8 +276,9 @@ def rebalance(
     lets a book be checked against a stricter persona's caps (R3); it
     defaults to `persona`.
 
-    Builds whole-share orders with `build_orders` and drops any order
-    under `config.MIN_TRADE_USD` (F11, sizing chain steps 4-5).
+    Builds whole-share orders through `orders_for_targets`, which drops
+    trades under `config.MIN_TRADE_USD` except cap-restoring sells
+    (F11, F7, sizing chain steps 4-5).
     """
     caps_persona = caps_persona or persona
     before_sector_weights = sector_weights(book, marks)
@@ -234,27 +295,91 @@ def rebalance(
         caps_persona.sector_cap,
     )
 
-    equity = _equity(book, marks)
-    # Absorbs float round-trip error (e.g. weight*equity/mark landing a hair
-    # under a held share count) before build_orders floors shares, so a
-    # target equal to the current weight never emits a spurious 1-share sell.
-    orders = build_orders(
-        final_weights,
-        _positions(book),
-        marks,
-        equity * (1 + SHARE_ROUNDING_TOLERANCE),
-    )
-    sized_orders = [
-        order
-        for order in orders
-        if order.price * order.quantity >= config.MIN_TRADE_USD
-    ]
+    orders = orders_for_targets(book, final_weights, marks, caps_persona.sector_cap)
+    equity = book_equity(book, marks)
 
     return RebalanceResult(
         target_weights=final_weights,
-        orders=sized_orders,
+        orders=orders,
         before_sector_weights=before_sector_weights,
         after_sector_weights=_sector_totals(
-            _weights_after_orders(book, sized_orders, marks, equity)
+            _weights_after_orders(book, orders, marks, equity)
         ),
     )
+
+
+def fear_greed_tilt(fear_greed: float | None) -> float:
+    """Return Q6's market-level conviction tilt: +0.10 below 25, -0.10 above 75, else 0."""
+    if fear_greed is None:
+        return 0.0  # feed unavailable -> tilt skipped ($0 Cost Guarantee)
+
+    if fear_greed < config.FEAR_GREED_LOW:
+        return config.FEAR_GREED_TILT
+
+    if fear_greed > config.FEAR_GREED_HIGH:
+        return -config.FEAR_GREED_TILT
+
+    return 0.0
+
+
+def _tilted(signal: Signal, tilt: float) -> Signal:
+    """Shift one analyst signal by the tilt, kept inside blend_signals' [-1, 1] range."""
+    tilted_value = max(-1.0, min(1.0, signal.value + tilt))
+    return signal.model_copy(update={"value": tilted_value})
+
+
+def blended_convictions(signals: list[Signal]) -> dict[str, float]:
+    """Return F12's conviction per ticker (0.6 x Technical + 0.4 x Sentiment), for the PM's prompt."""
+    blend = blend_signals(
+        signals,
+        MODEL_WEIGHTS,
+        1.0,
+        mode="long_only",
+        investment_approaches=LONG_ONLY_APPROACHES,
+    )
+    return blend.convictions
+
+
+def size_persona(
+    persona: config.Persona,
+    signals: list[Signal],
+    regime: config.Regime,
+    book: Book,
+    marks: dict[str, float],
+    fear_greed: float | None,
+    dropped_tickers: set[str],
+) -> RebalanceResult:
+    """Run the PRD sizing chain for one persona and return its targets and orders.
+
+    Blend (F12, gross = the regime's invested %), F&G tilt (Q6), PM drops
+    (R1), per-name max (F10), then the sector-cap layer, whole-share orders
+    and the $200 floor inside `rebalance` (F5-F8, F11, Q9).
+    """
+    invested_pct = persona.invested_pct_for_regime(regime)
+
+    # Model weights sum to 1, so shifting every analyst's value by the tilt
+    # shifts the blended conviction by the same amount (Q6).
+    tilt = fear_greed_tilt(fear_greed)
+    tilted_signals = [_tilted(signal, tilt) for signal in signals]
+    blend = blend_signals(
+        tilted_signals,
+        MODEL_WEIGHTS,
+        invested_pct,
+        mode="long_only",
+        investment_approaches=LONG_ONLY_APPROACHES,
+    )
+
+    # R1: a veto frees the name's weight for the Q9 refill; nothing is
+    # renormalized, so no other name is upsized.
+    kept_weights = {
+        ticker: weight
+        for ticker, weight in blend.weights.items()
+        if ticker not in dropped_tickers
+    }
+
+    limits = RiskLimits(
+        max_position_pct=persona.max_position_pct, max_gross_exposure=invested_pct
+    )
+    limited_weights = apply_limits(kept_weights, limits).weights
+
+    return rebalance(book, persona, limited_weights, marks, invested_pct)
