@@ -11,6 +11,7 @@ the approval records read back from `data/run_log.jsonl` draw the same way.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hmac
 import json
 import logging
@@ -379,22 +380,74 @@ def run_swarm(card_slots: dict[str, DeltaGenerator]) -> None:
     st.session_state["run_record"] = run_record.model_dump(mode="json")
 
 
+def order_time_note(order_count: int) -> str:
+    """Say how far apart SnapTrade orders go out and about how long `order_count` of them take (Risk #8)."""
+    import brokerage
+
+    spacing = brokerage.ORDER_SPACING_SECONDS
+    total_minutes = max(1, round(order_count * spacing / 60))
+    return (
+        f"spaced {spacing:g} s apart for SnapTrade's 10 requests/min limit, "
+        f"about {total_minutes} min in total"
+    )
+
+
+def caption_snaptrade_order_time(orders_by_persona: dict[str, list]) -> None:
+    """Estimate, beside an Approve button, how long the SnapTrade persona's spaced-out orders take."""
+    import brokerage
+
+    if not brokerage.is_alpaca_paper_configured():
+        return
+
+    for persona_key, orders in orders_by_persona.items():
+        is_snaptrade = config.PERSONAS[persona_key].account == "alpaca_paper"
+        if is_snaptrade and orders:
+            st.caption(
+                f"{display_name(persona_key)}'s {len(orders)} SnapTrade orders go out "
+                f"{order_time_note(len(orders))} (up to a minute more right after "
+                "other SnapTrade reads)."
+            )
+
+
+def show_order_progress(
+    progress_slot: DeltaGenerator,
+    persona_name: str,
+    order_number: int,
+    order_count: int,
+) -> None:
+    """Show which SnapTrade order is waiting its turn while the batch goes out."""
+    progress_slot.progress(
+        (order_number - 1) / order_count,
+        text=(
+            f"Placing {persona_name} order {order_number} of {order_count} "
+            f"({order_time_note(order_count)})"
+        ),
+    )
+
+
 def execute_for_persona(proposal: Proposal, persona_key: str, tag: str) -> str | None:
     """Execute one persona's leg of an approved proposal; return why it didn't run, or None when it did."""
     import execute
 
     persona_name = display_name(persona_key)
+    # Only SnapTrade orders report progress; the simulator fills at once.
+    progress_slot = st.empty()
+    report_progress = functools.partial(
+        show_order_progress, progress_slot, persona_name
+    )
     try:
         blocker = find_trade_blocker(persona_key)
         if blocker is not None:
             return f"{persona_name} skipped: {blocker}"
 
-        execute.execute(proposal, persona_key, tag=tag)
+        execute.execute(proposal, persona_key, tag=tag, report_progress=report_progress)
     except execute.ExecutionLockedError as error:
         return str(error)
     except Exception as error:
         logger.error("%s execution failed", persona_name, exc_info=error)
         return f"{persona_name} failed ({type(error).__name__}): {error}"
+    finally:
+        progress_slot.empty()
 
     return None
 
@@ -495,8 +548,12 @@ def caption_queued_lock() -> None:
 
 def approve_controls(run_record: dict) -> None:
     """Approve executes the proposal on screen for all three personas; nothing trades before it (story 22, T18)."""
-    caption_queued_lock()
-    if not st.button("Approve", type="primary", key="approve"):
+    approve_clicked = st.button("Approve", type="primary", key="approve")
+    caption_snaptrade_order_time(run_record["proposal"]["orders"])
+    if not approve_clicked:
+        # Not on the click: execute re-reads the lock fresh, and a read here
+        # would spend two of SnapTrade's 10 requests a minute (Risk #8).
+        caption_queued_lock()
         return
 
     from committee import Proposal
@@ -703,7 +760,11 @@ def render_rebalance_preview(
     if not result.orders:
         return
 
-    if st.button("Approve rebalance", key=f"approve_rebalance_{persona_key}"):
+    approve_clicked = st.button(
+        "Approve rebalance", key=f"approve_rebalance_{persona_key}"
+    )
+    caption_snaptrade_order_time({persona_key: result.orders})
+    if approve_clicked:
         approve_rebalance(persona_key, result)
 
 
