@@ -191,3 +191,6 @@ DISCLAIMER = (
 # Shared data files: books.py writes the run log, the app reads it (R9).
 DATA_DIR = Path(__file__).resolve().parent / "data"
 RUN_LOG_PATH = DATA_DIR / "run_log.jsonl"
+
+# P1 backtest output (S15): backtest.py writes it, the Backtest tab reads it.
+BACKTEST_RESULTS_PATH = DATA_DIR / "backtest_results.json"
