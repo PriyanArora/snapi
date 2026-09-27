@@ -16,7 +16,7 @@ import hmac
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
@@ -45,6 +45,23 @@ SANDBOX_SETUP_NOTE = (
     "Not configured. Set SNAPTRADE_CONSUMER_KEY, SNAPTRADE_CLIENT_ID and "
     "SNAPTRADE_SANDBOX_ACCOUNT_ID in .env to show the Sandbox's demo holdings."
 )
+
+ACTIVITY_SETUP_NOTE = (
+    "SnapTrade isn't configured. Set SNAPTRADE_CONSUMER_KEY, SNAPTRADE_CLIENT_ID, "
+    "SNAPTRADE_SANDBOX_ACCOUNT_ID and SNAPTRADE_ALPACA_PAPER_ACCOUNT_ID in .env "
+    "to show the Sandbox's activity and Alpaca Paper's order history."
+)
+NO_REPLAY_NOTE = "No replay saved yet."
+
+# Replay files the laptop writes and the public app reads (R7).
+ACTIVITY_SNAPSHOT_PATH = config.DATA_DIR / "activity_snapshot.json"
+
+# Cash dividends. REI (reinvestment) pairs with a DIVIDEND row, so counting
+# it too would double the income.
+DIVIDEND_TYPES = frozenset({"DIVIDEND", "SUBSTITUTE_DIVIDEND"})
+# Trades are hidden by default: the table is for corporate actions and
+# transfers (Q11), and our own orders have their own table.
+TRADE_TYPES = frozenset({"BUY", "SELL"})
 
 NEW_YORK = ZoneInfo("America/New_York")
 SATURDAY = 5  # datetime.weekday(): Monday is 0
@@ -79,6 +96,24 @@ def read_jsonl(path: Path) -> list[dict]:
             records.append(json.loads(line))
 
     return records
+
+
+def read_json(path: Path) -> dict | list | None:
+    """Return a saved replay file's contents, or None when it hasn't been saved yet."""
+    if not path.exists():
+        return None
+
+    return json.loads(path.read_text())
+
+
+def save_replay_button(label: str, path: Path, payload: dict | list) -> None:
+    """Offer to write this live view to its replay file, to be committed for the public app (R7)."""
+    if not st.button(label, key=f"save_{path.stem}"):
+        return
+
+    # default=str: SnapTrade's date fields may arrive as datetime objects.
+    path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
+    st.success(f"Saved data/{path.name}; commit it after the rehearsal.")
 
 
 def display_name(persona_key: str) -> str:
@@ -832,6 +867,111 @@ def forward_test_tab() -> None:
     st.plotly_chart(figure, key="forward_test")
 
 
+def dividend_income(activities: list[dict]) -> float:
+    """Return the cash dividends paid across the activity rows."""
+    income = 0.0
+    for activity in activities:
+        if activity["type"] in DIVIDEND_TYPES:
+            income += activity["amount"] or 0.0
+
+    return income
+
+
+def render_sandbox_activities(activities: list[dict]) -> None:
+    """Show dividend income and the Sandbox's activity rows, newest first, filtered by type (S12, Q11)."""
+    st.subheader("SnapTrade Sandbox activity (demo data)")
+    st.metric("Dividend income", f"${dividend_income(activities):,.2f}")
+
+    # SnapTrade's type is a best-effort string with no merger value, so
+    # the filter offers whatever types the data holds.
+    present_types = sorted({activity["type"] for activity in activities})
+    default_types = [name for name in present_types if name not in TRADE_TYPES]
+    chosen_types = st.multiselect(
+        "Types",
+        present_types,
+        default=default_types,
+        key="activity_types",
+    )
+
+    # SnapTrade already returns activities newest first.
+    shown = [activity for activity in activities if activity["type"] in chosen_types]
+    if not shown:
+        st.caption("No activity of the chosen types.")
+        return
+
+    st.dataframe(shown, hide_index=True)
+
+
+def render_alpaca_orders(orders: list[dict]) -> None:
+    """Show Balanced's Alpaca Paper orders from the last 24 h with their status, newest first."""
+    st.subheader("Alpaca Paper order history (last 24 h)")
+    st.caption(
+        "Alpaca Paper doesn't simulate dividends, so income shows for the Sandbox only."
+    )
+    if not orders:
+        st.caption("No orders in the last 24 hours.")
+        return
+
+    newest_first = sorted(
+        orders, key=lambda order: order["time_placed"] or "", reverse=True
+    )
+    st.dataframe(newest_first, hide_index=True)
+
+
+def live_activity() -> dict:
+    """Read the Sandbox's holdings and activity and Alpaca Paper's recent orders, each through the 60 s cache.
+
+    The recent-orders read is the same all-status call the R4 lock uses, so
+    queued orders show with their status (Q11).
+    """
+    import brokerage
+
+    sandbox_id = brokerage.sandbox_account_id()
+    sandbox = brokerage.get_account_snapshot(sandbox_id)
+    holdings = [dataclasses.asdict(holding) for holding in sandbox.holdings]
+    return {
+        "captured_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        # The Portfolio tab's Sandbox panel replays these (S16).
+        "sandbox_holdings": holdings,
+        "sandbox_activities": brokerage.get_activities(sandbox_id),
+        "alpaca_orders": brokerage.get_recent_orders(
+            brokerage.alpaca_paper_account_id()
+        ),
+    }
+
+
+def activity_tab() -> None:
+    """Show SnapTrade Sandbox activity and Alpaca Paper order history, read-only (S12, story 40)."""
+    if is_cloud_mode():
+        activity = read_json(ACTIVITY_SNAPSHOT_PATH)
+        if activity is None:
+            st.info(NO_REPLAY_NOTE)
+            return
+
+        st.caption(f"Replay of the activity saved at {activity['captured_at']}.")
+        render_sandbox_activities(activity["sandbox_activities"])
+        render_alpaca_orders(activity["alpaca_orders"])
+        return
+
+    import brokerage
+
+    if not (
+        brokerage.is_sandbox_configured() and brokerage.is_alpaca_paper_configured()
+    ):
+        st.info(ACTIVITY_SETUP_NOTE)
+        return
+
+    try:
+        activity = live_activity()
+    except Exception as error:
+        show_live_error("Reading SnapTrade activity", error)
+        return
+
+    render_sandbox_activities(activity["sandbox_activities"])
+    render_alpaca_orders(activity["alpaca_orders"])
+    save_replay_button("Save activity replay", ACTIVITY_SNAPSHOT_PATH, activity)
+
+
 def main() -> None:
     """Render the gated app; tabs follow the Q12 demo narrative."""
     st.set_page_config(page_title="snapi", layout="wide")
@@ -839,13 +979,15 @@ def main() -> None:
     check_password()
     prepare_live_books()
 
-    committee_area, portfolio_area, forward_test_area = st.tabs(
-        ["Committee", "Portfolio", "Forward test"]
+    committee_area, portfolio_area, activity_area, forward_test_area = st.tabs(
+        ["Committee", "Portfolio", "Activity", "Forward test"]
     )
     with committee_area:
         committee_tab()
     with portfolio_area:
         portfolio_tab()
+    with activity_area:
+        activity_tab()
     with forward_test_area:
         forward_test_tab()
 
