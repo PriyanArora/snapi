@@ -53,4 +53,3 @@ known-first-party = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-norecursedirs = [".*", "spec1", "spec2", "spec3", "external"]
