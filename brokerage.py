@@ -29,8 +29,9 @@ SANDBOX_ACCOUNT_ENV_VAR = "SNAPTRADE_SANDBOX_ACCOUNT_ID"
 CACHE_SECONDS = 60  # T19: at least 60 s between reads of one account
 ORDER_SPACING_SECONDS = 1.0  # Balanced step 4: at most one order per second
 ALPACA_PAPER_SLUG = "ALPACA-PAPER"
+OPEN_ORDERS_LOOKBACK_DAYS = 90  # the SDK's maximum `days` for account orders
 
-# R4: only these states mean an order is done. Anything else (queued,
+# R4: only these states mean a recent order is done. Anything else (queued,
 # accepted, partial, unknown) has not filled yet and keeps Balanced locked.
 FINISHED_ORDER_STATUSES = frozenset(
     {
@@ -225,8 +226,32 @@ def get_recent_orders(account_id: str) -> list[dict[str, str | float | None]]:
     return _cached_read(_fetch_recent_orders, account_id)
 
 
+def _fetch_open_orders(account_id: str) -> list[dict[str, str | float | None]]:
+    """Read every order SnapTrade still lists as open, over the longest window it allows."""
+    response = get_client().account_information.get_user_account_orders(
+        account_id=account_id,
+        state="open",
+        days=OPEN_ORDERS_LOOKBACK_DAYS,
+    )
+    return [_order_row(order) for order in response.body]
+
+
+def get_open_orders(account_id: str) -> list[dict[str, str | float | None]]:
+    """Return the account's open orders from the last 90 days, cached (R4)."""
+    return _cached_read(_fetch_open_orders, account_id)
+
+
 def has_unfilled_orders(account_id: str) -> bool:
-    """Return True while any recent order has not reached a finished status (Balanced step 7, R4)."""
+    """Return True while any order is still open, which keeps Balanced locked (Balanced step 7, R4).
+
+    Any order SnapTrade lists as open locks, as does any last-24h order
+    that isn't in a finished status, unknown statuses included.
+    """
+    if get_open_orders(account_id):
+        return True
+
+    # Without real-time data SnapTrade refreshes the 90-day list once a day,
+    # so an order sent minutes ago may be missing; the 24 h read is realtime.
     for order in get_recent_orders(account_id):
         if order["status"] not in FINISHED_ORDER_STATUSES:
             return True
