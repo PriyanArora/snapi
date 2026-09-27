@@ -11,6 +11,7 @@ way.
 
 from __future__ import annotations
 
+import dataclasses
 import hmac
 import json
 import logging
@@ -18,6 +19,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -27,6 +29,7 @@ if TYPE_CHECKING:
     from streamlit.delta_generator import DeltaGenerator
 
     from committee import Proposal, Snapshot
+    from portfolio import Book, RebalanceResult
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +38,10 @@ ANTHROPIC_KEY_ENV_VAR = "ANTHROPIC_API_KEY"
 SNAPTRADE_SETUP_NOTE = (
     "SnapTrade isn't configured. Set SNAPTRADE_CONSUMER_KEY, SNAPTRADE_CLIENT_ID "
     "and SNAPTRADE_ALPACA_PAPER_ACCOUNT_ID in .env."
+)
+SANDBOX_SETUP_NOTE = (
+    "Not configured. Set SNAPTRADE_CONSUMER_KEY, SNAPTRADE_CLIENT_ID and "
+    "SNAPTRADE_SANDBOX_ACCOUNT_ID in .env to show the Sandbox's demo holdings."
 )
 
 ANALYSTS = ("sentiment", "technical", "macro")
@@ -426,6 +433,7 @@ def approve_controls(run_record: dict) -> None:
         list(config.PERSONAS),
         tag="committee",
     )
+    clear_rebalance_state()
 
 
 def committee_tab() -> None:
@@ -476,6 +484,288 @@ def committee_tab() -> None:
             render_execution(persona_key, approval)
 
 
+def display_name(persona_key: str) -> str:
+    """Return the persona's display name, for selector labels."""
+    return config.PERSONAS[persona_key].display_name
+
+
+def book_equity(book: dict, marks: dict[str, float]) -> float:
+    """Return a JSON-shaped book's value: cash plus every position at its mark."""
+    positions_value = 0.0
+    for ticker, shares in book["shares"].items():
+        positions_value += shares * marks[ticker]
+
+    return book["cash"] + positions_value
+
+
+def holdings_rows(book: dict, marks: dict[str, float]) -> list[dict]:
+    """Return one table row per held ticker: sector, shares, mark, value, weight and average cost."""
+    equity = book_equity(book, marks)
+
+    rows = []
+    for ticker, shares in sorted(book["shares"].items()):
+        value = shares * marks[ticker]
+        avg_cost = book["avg_cost"].get(ticker)
+        rows.append(
+            {
+                "Ticker": ticker,
+                "Sector": config.SECTOR_BY_TICKER[ticker],
+                "Shares": shares,
+                "Price": round(marks[ticker], 2),
+                "Value": round(value, 2),
+                "Weight %": round(100 * value / equity, 1),
+                "Avg cost": None if avg_cost is None else round(avg_cost, 2),
+            }
+        )
+
+    return rows
+
+
+def sector_chart(
+    weights_by_series: dict[str, dict[str, float]],
+    caps_key: str,
+) -> go.Figure:
+    """Return grouped bars of sector weights (%) with a dashed line at the chosen persona's sector cap (S10)."""
+    caps_persona = config.PERSONAS[caps_key]
+
+    figure = go.Figure()
+    for series_name, weights in weights_by_series.items():
+        percents = [100 * weights[sector] for sector in config.SECTORS]
+        figure.add_bar(x=list(config.SECTORS), y=percents, name=series_name)
+
+    figure.add_hline(
+        y=100 * caps_persona.sector_cap,
+        line_dash="dash",
+        annotation_text=f"{caps_persona.display_name} cap {caps_persona.sector_cap:.0%}",
+    )
+    figure.update_layout(
+        barmode="group",
+        yaxis_title="Weight (%)",
+        height=320,
+        showlegend=len(weights_by_series) > 1,
+    )
+    return figure
+
+
+def render_book(
+    persona_key: str,
+    book: dict,
+    marks: dict[str, float],
+    sector_weights: dict[str, float],
+) -> None:
+    """Show one persona's limits, NAV, cash, holdings and sector weights against its own cap (S10, story 38)."""
+    persona = config.PERSONAS[persona_key]
+    st.caption(
+        f"Sector cap {persona.sector_cap:.0%}, max per name "
+        f"{persona.max_position_pct:.0%}, cash buffer {persona.cash_buffer:.0%}"
+    )
+    nav_column, cash_column = st.columns(2)
+    nav_column.metric("NAV", f"${book_equity(book, marks):,.0f}")
+    cash_column.metric("Cash", f"${book['cash']:,.0f}")
+
+    holdings_column, chart_column = st.columns(2)
+    with holdings_column:
+        holdings = holdings_rows(book, marks)
+        if holdings:
+            st.dataframe(holdings, hide_index=True)
+        else:
+            st.caption("All cash: no positions yet.")
+    with chart_column:
+        figure = sector_chart({"Now": sector_weights}, persona_key)
+        st.plotly_chart(figure, key=f"sectors_{persona_key}")
+
+
+def preview_rebalance(
+    persona_key: str,
+    caps_key: str,
+    book: Book,
+    marks: dict[str, float],
+) -> RebalanceResult:
+    """Run the cycle's own sector-cap layer on the book's current weights; no LLM call (S8, stories 30-32)."""
+    import books
+    import portfolio
+
+    persona = config.PERSONAS[persona_key]
+    invested_pct = persona.invested_pct_for_regime(books.current_regime())
+    return portfolio.rebalance(
+        book,
+        persona,
+        portfolio.weights_by_ticker(book, marks),
+        marks,
+        invested_pct,
+        caps_persona=config.PERSONAS[caps_key],
+    )
+
+
+def approve_rebalance(persona_key: str, result: RebalanceResult) -> None:
+    """Send the previewed rebalance through the same `execute` as Approve, then redraw the fresh book (story 32)."""
+    from committee import Proposal
+
+    proposal = Proposal(
+        target_weights={persona_key: result.target_weights},
+        orders={persona_key: result.orders},
+    )
+    st.session_state[f"rebalance_outcome_{persona_key}"] = execute_personas(
+        proposal,
+        [persona_key],
+        tag="rebalance",
+    )
+    del st.session_state[f"rebalance_preview_{persona_key}"]
+    st.rerun()
+
+
+def render_rebalance_preview(
+    persona_key: str,
+    caps_key: str,
+    result: RebalanceResult,
+) -> None:
+    """Show before/after sector weights and the orders; only a preview on the persona's own caps is approvable (R3)."""
+    st.markdown(f"**Rebalance preview against {display_name(caps_key)}'s caps**")
+    before_and_after = {
+        "Before": result.before_sector_weights,
+        "After": result.after_sector_weights,
+    }
+    figure = sector_chart(before_and_after, caps_key)
+    st.plotly_chart(figure, key=f"rebalance_chart_{persona_key}")
+    render_orders([order.model_dump() for order in result.orders])
+
+    # A stricter mandate is a what-if: the persona's own caps still apply
+    # on the next committee cycle.
+    if caps_key != persona_key:
+        st.caption(
+            f"Preview only: what moving to {display_name(caps_key)}'s caps would trade."
+        )
+        return
+
+    if not result.orders:
+        return
+
+    if st.button("Approve rebalance", key=f"approve_rebalance_{persona_key}"):
+        approve_rebalance(persona_key, result)
+
+
+def rebalance_controls(persona_key: str, book: Book, marks: dict[str, float]) -> None:
+    """Rebalance on demand, optionally against another persona's caps; the preview lives in the session (S8, R3)."""
+    persona_keys = list(config.PERSONAS)
+    caps_key = st.selectbox(
+        "Check against caps of",
+        persona_keys,
+        index=persona_keys.index(persona_key),
+        format_func=display_name,
+        key=f"caps_{persona_key}",
+    )
+    preview_key = f"rebalance_preview_{persona_key}"
+    outcome_key = f"rebalance_outcome_{persona_key}"
+
+    # Kept in session_state: a button under another button's `if` never
+    # fires, because the outer button is False again on that rerun.
+    if st.button("Rebalance", key=f"rebalance_{persona_key}"):
+        st.session_state.pop(preview_key, None)
+        st.session_state.pop(outcome_key, None)
+        try:
+            result = preview_rebalance(persona_key, caps_key, book, marks)
+        except Exception as error:
+            show_live_error("Rebalance", error)
+        else:
+            st.session_state[preview_key] = (caps_key, result)
+
+    outcome = st.session_state.get(outcome_key)
+    if outcome is not None:
+        render_execution(persona_key, outcome)
+
+    preview = st.session_state.get(preview_key)
+    if preview is not None:
+        previewed_caps_key, result = preview
+        render_rebalance_preview(persona_key, previewed_caps_key, result)
+
+
+def clear_rebalance_state() -> None:
+    """Forget every rebalance preview and outcome once the books change underneath them."""
+    for persona_key in config.PERSONAS:
+        st.session_state.pop(f"rebalance_preview_{persona_key}", None)
+        st.session_state.pop(f"rebalance_outcome_{persona_key}", None)
+
+
+def render_sandbox(rows: list[dict]) -> None:
+    """Show the SnapTrade Sandbox's demo holdings on their own; they never join a persona's book (S16, story 59)."""
+    st.caption(
+        "Pre-filled demo holdings from SnapTrade's read-only Sandbox. "
+        "They are not part of any persona's book."
+    )
+    if not rows:
+        st.caption("The Sandbox account holds nothing.")
+        return
+
+    st.dataframe(rows, hide_index=True)
+
+
+def sandbox_panel() -> None:
+    """Read the Sandbox holdings through the shared 60 s SnapTrade cache and show them, or say why not."""
+    import brokerage
+
+    st.subheader("SnapTrade Sandbox (demo data)")
+    if not brokerage.is_sandbox_configured():
+        st.caption(SANDBOX_SETUP_NOTE)
+        return
+
+    try:
+        account = brokerage.get_account_snapshot(brokerage.sandbox_account_id())
+    except Exception as error:
+        show_live_error("Reading the SnapTrade Sandbox", error)
+        return
+
+    render_sandbox([dataclasses.asdict(holding) for holding in account.holdings])
+
+
+def reset_books_control() -> None:
+    """Clear the simulator fill logs and re-seed the opening books, for a clean rehearsal (S16, story 58)."""
+    import execute
+
+    st.subheader("Reset books")
+    if st.session_state.pop("books_reset", False):
+        st.success("Simulator books cleared and re-seeded.")
+
+    confirmed = st.checkbox(
+        "Clear the simulator fill logs and re-seed the opening books",
+        key="confirm_reset",
+    )
+    if not st.button("Reset books", disabled=not confirmed, key="reset_books"):
+        return
+
+    clear_rebalance_state()
+    try:
+        execute.reset_books()
+    except Exception as error:
+        show_live_error("Reset books", error)
+        return
+
+    st.session_state["books_reset"] = True
+    st.rerun()
+
+
+def portfolio_tab() -> None:
+    """Per-persona holdings and sector charts with Rebalance, then the Sandbox panel and Reset books."""
+    import books
+    import portfolio
+    import prices
+
+    marks = prices.latest_marks()
+    for persona_key, persona in config.PERSONAS.items():
+        st.subheader(persona.display_name)
+        try:
+            book = books.current_book(persona_key)
+        except Exception as error:
+            show_live_error(f"Reading {persona.display_name}'s book", error)
+            continue
+
+        weights_by_sector = portfolio.sector_weights(book, marks)
+        render_book(persona_key, dataclasses.asdict(book), marks, weights_by_sector)
+        rebalance_controls(persona_key, book, marks)
+
+    sandbox_panel()
+    reset_books_control()
+
+
 def main() -> None:
     """Render the gated app; tabs follow the Q12 demo narrative."""
     st.set_page_config(page_title="snapi", layout="wide")
@@ -483,9 +773,11 @@ def main() -> None:
     check_password()
     prepare_live_books()
 
-    (committee_area,) = st.tabs(["Committee"])
+    committee_area, portfolio_area = st.tabs(["Committee", "Portfolio"])
     with committee_area:
         committee_tab()
+    with portfolio_area:
+        portfolio_tab()
 
 
 if __name__ == "__main__":
