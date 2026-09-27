@@ -1,20 +1,32 @@
 """Persona books, the per-cycle snapshot and the run log (PRD Execution, S14, S16, R9).
 
 Conservative and Aggressive live in a fill log each (`data/fills_<persona>.jsonl`),
-rebuilt at start-up by replaying the fills into a fresh SimBroker; no
-database. Balanced's book comes from its Alpaca Paper account through the
-cached SnapTrade read. `take_snapshot` gathers one cycle's frozen inputs
-and `log_run` records NAV per persona on every Run swarm (F23), so the
-forward test builds up with no scheduler.
+rebuilt at start-up by replaying the fills into a fresh SimBroker.
+Balanced's book comes from its Alpaca Paper account through the cached
+SnapTrade read. `take_snapshot` gathers one cycle's frozen inputs and
+`log_run` records NAV per persona on every Run swarm (F23), so the forward
+test builds up with no scheduler.
+
+When MONGODB_URI is set, every log is instead a MongoDB collection named
+after its file (`fills_conservative`, `run_log`, ...), because Streamlit
+Cloud's disk is wiped on sleep and redeploy (Hosting). Unset, the JSONL
+files stay, so the tests run offline.
 """
 
 from __future__ import annotations
 
+import functools
+import json
+import os
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel
+from pymongo import MongoClient
+from pymongo.collection import Collection
+from pymongo.database import Database
 
 import brokerage
 import feeds
@@ -30,6 +42,10 @@ FillTag = Literal["committee", "rebalance", "seed"]
 
 # S16: the two simulator personas that get an opening book; Balanced never does.
 SEED_PERSONAS = ("conservative", "aggressive")
+
+MONGODB_URI_ENV_VAR = "MONGODB_URI"
+# Atlas's SRV connection strings name no database, so the logs go here.
+DEFAULT_MONGODB_DATABASE = "snapi"
 
 
 class FillRecord(BaseModel):
@@ -65,23 +81,83 @@ class ApprovalRecord(BaseModel):
     fills: list[Fill]
 
 
-def fills_path(persona_key: str) -> Path:
-    """Return the persona's fill-log file, its whole simulated history (R9)."""
-    return DATA_DIR / f"fills_{persona_key}.jsonl"
+@functools.cache
+def _mongodb_database(mongodb_uri: str) -> Database:
+    """Return the URI's own database, else "snapi", on one MongoClient kept for the process."""
+    return MongoClient(mongodb_uri).get_default_database(DEFAULT_MONGODB_DATABASE)
 
 
-def _read_fills(persona_key: str) -> list[FillRecord]:
-    """Return the persona's recorded fills in order; a corrupt line raises rather than replaying a wrong book."""
-    path = fills_path(persona_key)
+def _log_collection(path: Path) -> Collection | None:
+    """Return the MongoDB collection named after a log file when MONGODB_URI is set, else None (R9)."""
+    mongodb_uri = os.environ.get(MONGODB_URI_ENV_VAR)
+    if not mongodb_uri:
+        return None
+
+    return _mongodb_database(mongodb_uri)[path.stem]
+
+
+def _read_log(path: Path) -> list[dict]:
+    """Return a log's records in the order they were appended, from MongoDB or the JSONL file."""
+    collection = _log_collection(path)
+    if collection is not None:
+        # One client's ObjectIds grow with every insert, so _id order is
+        # append order; SimBroker replay depends on it.
+        # ponytail: two processes writing one log in the same second could
+        # interleave; add a counter document if the laptop and Cloud ever do.
+        return list(collection.find({}, {"_id": False}).sort("_id"))
+
     if not path.exists():
         return []
 
     records = []
     for line in path.read_text().splitlines():
         if line.strip():
-            records.append(FillRecord.model_validate_json(line))
+            records.append(json.loads(line))
 
     return records
+
+
+def _append_log(path: Path, records: Sequence[BaseModel]) -> None:
+    """Append records, in order, to a log in MongoDB or its JSONL file."""
+    # insert_many refuses an empty list.
+    if not records:
+        return
+
+    collection = _log_collection(path)
+    if collection is not None:
+        documents = [record.model_dump(mode="json") for record in records]
+        collection.insert_many(documents)
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as log_file:
+        for record in records:
+            log_file.write(record.model_dump_json() + "\n")
+
+
+def fills_path(persona_key: str) -> Path:
+    """Return the persona's fill-log file, its whole simulated history (R9)."""
+    return DATA_DIR / f"fills_{persona_key}.jsonl"
+
+
+def _read_fills(persona_key: str) -> list[FillRecord]:
+    """Return the persona's recorded fills in order; a corrupt record raises rather than replaying a wrong book."""
+    records = []
+    for document in _read_log(fills_path(persona_key)):
+        records.append(FillRecord.model_validate(document))
+
+    return records
+
+
+def clear_fills(persona_key: str) -> None:
+    """Delete the persona's whole fill log, from MongoDB or the disk (S16 Reset books)."""
+    path = fills_path(persona_key)
+    collection = _log_collection(path)
+    if collection is not None:
+        collection.drop()
+        return
+
+    path.unlink(missing_ok=True)
 
 
 def has_fills(persona_key: str) -> bool:
@@ -188,12 +264,10 @@ def current_book(persona_key: str) -> Book:
 def append_fills(persona_key: str, fills: list[Fill], tag: FillTag) -> None:
     """Append one batch of simulator fills to the persona's fill log."""
     filled_at = datetime.now(UTC)
-    path = fills_path(persona_key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    with path.open("a") as fill_log:
-        for fill in fills:
-            record = FillRecord(
+    records = []
+    for fill in fills:
+        records.append(
+            FillRecord(
                 ticker=fill.ticker,
                 side=fill.side,
                 quantity=fill.quantity,
@@ -201,7 +275,9 @@ def append_fills(persona_key: str, fills: list[Fill], tag: FillTag) -> None:
                 filled_at=filled_at,
                 tag=tag,
             )
-            fill_log.write(record.model_dump_json() + "\n")
+        )
+
+    _append_log(fills_path(persona_key), records)
 
 
 def current_regime() -> Regime:
@@ -236,9 +312,12 @@ def take_snapshot() -> Snapshot:
 
 def append_run_log(record: RunRecord | ApprovalRecord) -> None:
     """Append one record to the run log that the forward test reads."""
-    RUN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with RUN_LOG_PATH.open("a") as run_log:
-        run_log.write(record.model_dump_json() + "\n")
+    _append_log(RUN_LOG_PATH, [record])
+
+
+def read_run_log() -> list[dict]:
+    """Return every run and approval record as plain JSON dicts, oldest first, for the dashboard."""
+    return _read_log(RUN_LOG_PATH)
 
 
 def log_run(snapshot: Snapshot, proposal: Proposal) -> RunRecord:

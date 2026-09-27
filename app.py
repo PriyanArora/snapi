@@ -5,7 +5,11 @@ in: langgraph, langchain, snaptrade, external/) are imported inside the live
 functions that need them, not at the top. The PRD asks for lazy imports to
 keep start-up fast; that overrides the usual imports-at-the-top rule.
 Renderers take plain JSON-shaped dicts: the run kept in the session and
-the approval records read back from `data/run_log.jsonl` draw the same way.
+the approval records read back from the run log draw the same way.
+
+Every setting is an env var, the same on localhost and Streamlit Cloud:
+`.env` locally, the app's Secrets on Cloud, which Streamlit copies into
+os.environ (Hosting, T17).
 """
 
 from __future__ import annotations
@@ -17,7 +21,6 @@ import json
 import logging
 import os
 from datetime import datetime
-from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
@@ -36,7 +39,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-APP_PASSWORD_SECRET = "APP_PASSWORD"
+APP_PASSWORD_ENV_VAR = "APP_PASSWORD"
 ANTHROPIC_KEY_ENV_VAR = "ANTHROPIC_API_KEY"
 # The macro regime behind seeding, Run swarm, Rebalance and Reset books.
 FRED_KEY_ENV_VAR = "FRED_API_KEY"
@@ -103,19 +106,6 @@ CARD_BY_NODE = {
 }
 
 
-def read_jsonl(path: Path) -> list[dict]:
-    """Return one dict per non-blank line of a JSON-lines file, or [] when it doesn't exist yet."""
-    if not path.exists():
-        return []
-
-    records = []
-    for line in path.read_text().splitlines():
-        if line.strip():
-            records.append(json.loads(line))
-
-    return records
-
-
 def display_name(persona_key: str) -> str:
     """Return the persona's display name, for selector labels and notes."""
     return config.PERSONAS[persona_key].display_name
@@ -138,11 +128,15 @@ def escape_markdown_math(text: str) -> str:
 
 
 def read_app_password() -> str | None:
-    """Return APP_PASSWORD from Streamlit secrets, or None when there is no secrets file or no such key."""
+    """Return APP_PASSWORD from the environment, else from Streamlit secrets, else None (T17)."""
+    env_password = os.environ.get(APP_PASSWORD_ENV_VAR)
+    if env_password:
+        return env_password
+
     try:
-        return str(st.secrets[APP_PASSWORD_SECRET])
+        return str(st.secrets[APP_PASSWORD_ENV_VAR])
     except (FileNotFoundError, KeyError):
-        # No .streamlit/secrets.toml raises a FileNotFoundError subclass.
+        # No secrets file raises a FileNotFoundError subclass.
         return None
 
 
@@ -167,8 +161,8 @@ def check_password() -> None:
 
     if not read_app_password():
         st.error(
-            f"No {APP_PASSWORD_SECRET} found. Add it to .streamlit/secrets.toml "
-            "and reload."
+            f"No {APP_PASSWORD_ENV_VAR} found. Set it in .env (or the app's Secrets "
+            "on Streamlit Cloud) and restart the app."
         )
         st.stop()
 
@@ -211,7 +205,15 @@ def seed_opening_books() -> None:
     import books
     import execute
 
-    is_seeded = all(books.has_fills(persona_key) for persona_key in books.SEED_PERSONAS)
+    try:
+        is_seeded = all(
+            books.has_fills(persona_key) for persona_key in books.SEED_PERSONAS
+        )
+    except Exception as error:
+        # An unreachable MongoDB must not take down the tabs that don't need it.
+        show_live_error("Reading the fill logs", error)
+        return
+
     if is_seeded:
         return
 
@@ -454,7 +456,9 @@ def execute_for_persona(proposal: Proposal, persona_key: str, tag: str) -> str |
 
 def execute_personas(proposal: Proposal, persona_keys: list[str], tag: str) -> dict:
     """Execute each persona's leg and return the skip notes plus the run-log records it wrote."""
-    first_new_line = len(read_jsonl(config.RUN_LOG_PATH))
+    import books
+
+    first_new_record = len(books.read_run_log())
 
     notes = {}
     for persona_key in persona_keys:
@@ -462,7 +466,7 @@ def execute_personas(proposal: Proposal, persona_keys: list[str], tag: str) -> d
         if note is not None:
             notes[persona_key] = note
 
-    new_records = read_jsonl(config.RUN_LOG_PATH)[first_new_line:]
+    new_records = books.read_run_log()[first_new_record:]
     return {"notes": notes, "records": new_records}
 
 
@@ -915,7 +919,14 @@ def normalized(values: list[float]) -> list[float]:
 
 def forward_test_tab() -> None:
     """Plot NAV per persona and SPY from the run log, normalized to the first logged run (S14, F23, stories 44-45)."""
-    run_records = read_jsonl(config.RUN_LOG_PATH)
+    import books
+
+    try:
+        run_records = books.read_run_log()
+    except Exception as error:
+        show_live_error("Reading the run log", error)
+        return
+
     runs = [record for record in run_records if record["kind"] == "run"]
     if not runs:
         st.info(
@@ -1173,7 +1184,11 @@ def chat_tab() -> None:
 def main() -> None:
     """Render the gated app; tabs follow the Q12 demo narrative."""
     st.set_page_config(page_title="snapi", layout="wide")
-    load_dotenv()  # keys from .env
+    # Cloud's root-level Secrets reach os.environ only once st.secrets is
+    # parsed. `streamlit run` parses it at start-up; this covers any other
+    # start (AppTest) and is a no-op without a secrets file.
+    st.secrets.load_if_toml_exists()
+    load_dotenv()  # .env fills in only what isn't set already
     check_password()
     prepare_live_books()
 

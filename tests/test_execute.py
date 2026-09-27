@@ -26,7 +26,8 @@ MARKS = latest_marks()
 
 @pytest.fixture(autouse=True)
 def isolate_logs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Keep every fill log and the run log out of data/."""
+    """Keep every fill log and the run log out of data/ and out of MongoDB."""
+    monkeypatch.delenv(books.MONGODB_URI_ENV_VAR, raising=False)
     monkeypatch.setattr(books, "DATA_DIR", tmp_path)
     monkeypatch.setattr(books, "RUN_LOG_PATH", tmp_path / "run_log.jsonl")
 
