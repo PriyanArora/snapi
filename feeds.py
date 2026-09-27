@@ -45,7 +45,7 @@ ALPHA_VANTAGE_REJECTION_KEYS = ("Note", "Information", "Error Message")
 
 REQUEST_TIMEOUT_SECONDS = 10
 
-# The free tier also caps burst rate at 1 request/second (Risk #16); this is
+# The free tier also caps burst rate at about 1 request/second; this is
 # pacing, not a retry.
 ALPHA_VANTAGE_PACE_SECONDS = 1
 
