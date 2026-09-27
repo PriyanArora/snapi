@@ -7,9 +7,9 @@ analyst owns its own state key and is wrapped so a failure abstains instead
 of discarding the whole run (story 9) -- a LangGraph superstep is
 transactional, so one failing branch would otherwise cancel the others.
 
-`run_committee(snapshot) -> proposal` is the entry point for tests and for
-`books.take_snapshot` + Approve; `app.py` instead streams `build_graph()` in
-"updates" mode and calls `build_proposal` on the merged result.
+`run_committee(snapshot) -> proposal` is the PRD's entry point (seam 1);
+`app.py` instead streams `build_graph()` in "updates" mode, so each card
+fills as its node finishes, and calls `build_proposal` on the merged result.
 """
 
 from __future__ import annotations
