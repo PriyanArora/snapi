@@ -53,7 +53,7 @@ NAV_PAGES = ("Committee", "Portfolio", "Chat", "Forward test", "Backtest")
 RECENT_ACTIVITY_ROWS = 5
 # Fits the five links; a "content" width measures the shadcn root before
 # its buttons render, so the links spilled out of the navbar.
-NAV_LINKS_WIDTH = 500
+NAV_LINKS_WIDTH = 540
 # SnapTrade codes whose sentence-case form reads badly.
 ACTIVITY_TYPE_LABELS = {"REI": "Dividend reinvestment"}
 LOGO_FONT_URL = (
@@ -114,7 +114,7 @@ header[data-testid="stHeader"] { display: none; }
   z-index: 999;
 }
 .st-key-navbar {
-  padding: 0.35rem 0.75rem;
+  padding: 0.7rem 1.1rem;
   background: rgba(255, 255, 255, 0.55);
   backdrop-filter: blur(16px) saturate(160%);
   -webkit-backdrop-filter: blur(16px) saturate(160%);
@@ -122,13 +122,19 @@ header[data-testid="stHeader"] { display: none; }
   border-radius: 16px;
   box-shadow: 0 8px 24px rgba(15, 27, 61, 0.06);
 }
+/* Ghost buttons hover with --accent: a light yellow in the navbar. */
+.st-key-navbar [data-ssui-v2-host] {
+  --accent: #FFF1B8;
+  --accent-foreground: #0F1B3D;
+  --text-sm: 0.95rem;
+}
 .st-key-nav_logo [data-ssui-v2-host] {
   font-family: 'Playfair Display', serif;
   font-style: italic;
-  --text-sm: 1.9rem;
+  --text-sm: 1.5rem;
   --text-sm--line-height: 1;
   --font-weight-medium: 800;
-  --spacing: 0.3rem;
+  --spacing: 0.26rem;
 }
 [class*="st-key-brokerage_card_"] {
   background: rgba(255, 255, 255, 0.7);
@@ -140,13 +146,21 @@ header[data-testid="stHeader"] { display: none; }
 .snapi-hero h1 {
   margin: 0;
   padding: 0;
-  font-size: clamp(2.2rem, 4.2vw, 3.75rem);
+  font-size: clamp(3rem, 6.5vw, 6rem);
   font-weight: 800;
-  line-height: 1.08;
-  letter-spacing: -0.03em;
+  line-height: 1.02;
+  letter-spacing: -0.035em;
   color: #0F1B3D;
 }
-.snapi-hero h1 span { display: block; color: #56637F; font-weight: 700; }
+.snapi-hero h1 span {
+  display: block;
+  margin-top: 0.5rem;
+  font-size: clamp(2.2rem, 4.2vw, 3.75rem);
+  font-weight: 700;
+  line-height: 1.08;
+  letter-spacing: -0.03em;
+  color: #56637F;
+}
 .snapi-total { margin: 2.5rem 0 2rem; }
 .snapi-total p { margin: 0; color: #56637F; font-weight: 600; }
 .snapi-total strong {
@@ -296,16 +310,12 @@ def render_login_card() -> tuple[str, bool]:
                         login.text(config.DISCLAIMER, variant="caption")
 
     entered_password = password_field.value or ""
-    # Enter commits the field without a click, so a newly committed value is a
-    # submit too. A value already seen (Show/Hide committed it) is not.
-    is_new_value = entered_password != st.session_state.get("seen_password", "")
-    st.session_state["seen_password"] = entered_password
     if show_button.clicked:
         st.session_state["show_password"] = not is_password_shown
         st.rerun()
 
-    is_submitted = continue_button.clicked or (bool(entered_password) and is_new_value)
-    return entered_password, is_submitted
+    # Only Continue logs in: Enter and Show/Hide also commit the field.
+    return entered_password, continue_button.clicked
 
 
 def check_password() -> None:
@@ -331,7 +341,6 @@ def check_password() -> None:
 
         if is_password_correct(entered_password):
             st.session_state["password_ok"] = True
-            del st.session_state["seen_password"]
             st.rerun()
 
         ui.alert(
