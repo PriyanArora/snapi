@@ -106,4 +106,8 @@ You need [uv](https://docs.astral.sh/uv/), which installs Python 3.12 for you, a
 2. Paste your `.env` lines into the app's Secrets as TOML, one `KEY = "value"` per line. Streamlit turns them into environment variables, so nothing in the code changes.
 3. Set `MONGODB_URI` so the books and history survive restarts.
 
+## Attribution
+
+The 7 files in `external/` (`models.py`, `broker_models.py`, `sim.py`, `execution.py`, `limits.py`, `construction.py` and `cache.py`) come from [virattt/ai-hedge-fund](https://github.com/virattt/ai-hedge-fund) at commit `5d2c7ca`, used under the MIT License, Copyright (c) 2024 Virat Singh. They are changed only where needed to run here: their imports, two type aliases written inline in `construction.py`, and a local cache folder in `cache.py`. The full license is in [`external/LICENSE`](external/LICENSE).
+
 > Educational project built for Hack Atlantic. All trading is paper trading, no real money is used or at risk, and nothing here is investment advice.
